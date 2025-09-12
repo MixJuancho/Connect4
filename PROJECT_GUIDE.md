@@ -41,323 +41,209 @@ ServerScriptService/
 StarterPlayer/
   StarterPlayerScripts/
     Connect4.client.luau  (narration listener)
-```
-Dynamic runtime folders per session inside each `Connect4` model:
-- `SpawnedTokens` – holds placed token models.
-- `ColumnHitboxes` – one Part per column with a ClickDetector.
-- `DebugCells` – optional small parts marking cell centers when `DEBUG_CELL_MARKERS = true`.
-- (World Label) The capacity TextLabel is searched via: `slotModel.Capacity.Display.Frame.Textlabel` (SurfaceGui/BillboardGui) or fallback `slotModel.Display` and then first descendant `TextLabel`.
+# Connect4 Multi-Table System – Final Guide
 
-
-The in-match narration shown to each player is NOT the same as the world capacity label. The TextLabel is found in StarterGUI-ScreenGUI.Frames.Match.TextLabel
+This guide documents the finalized multi‑table Connect 4 implementation (alignment ref part, centered geometry, skip‑turn timeout, camera focus, and win highlighting).
 
 ---
-## 3. Core Data Structures
-### 3.1 Session Object (per slot)
+## 1. Overview
+Multiple simultaneous games run on physical slot models under `Workspace.PlayingSlots`. Each slot has a `Connect4` model and seats for two players. When both are seated: 5s countdown -> match starts -> seats lock -> players alternate clicks on column hitboxes. System is server‑authoritative.
+
+Key server features:
+* Auto slot discovery & per‑slot session state
+* Alignment override part (`Grid/Alignment`) for geometry (movement/resize live rebuild)
+* Centered column hitboxes & token placement with optional `FrontOffset` attribute
+* Turn timer (25s + 10s warning). Timeout now skips the turn (no immediate end)
+* Win chain detection returning exact coordinates
+* Win highlight tween using `ReplicatedStorage.Highlight` (optional) before ending match
+* Camera focus / reset events (`MatchCamera`) – client handles cinematic view & temporary player transparency
+* Token skins + hue disambiguation for same-skin players
+* Robust seat locking & graceful cleanup
+
+Client features:
+* Receives match narration via `Narrate`
+* Camera / transparency handling via `MatchCamera`
+
+---
+## 2. Expected Hierarchy
+```
+ReplicatedStorage/
+  Connect4/
+    Narrate (RemoteEvent)
+    MatchCamera (RemoteEvent)
+  Tokens/
+    Red
+    Yellow
+    <OtherSkinModels>
+  Highlight (Highlight)  -- optional template for win effect
+Workspace/
+  PlayingSlots/
+    <SlotModel>/
+      Connect4/
+        Grid (Part or Model)
+          Alignment (Part, optional precision ref)
+      (Two Seat descendants somewhere under SlotModel)
+ServerScriptService/Server/Connect4.server.luau
+StarterPlayer/StarterPlayerScripts/Connect4.client.luau
+```
+Runtime folders: `SpawnedTokens`, `ColumnHitboxes`, optional `DebugCells`.
+
+---
+## 3. Session State
 ```
 session = {
-  slotModel: Model,            -- The slot base model
-  connect4Model: Model,        -- The Connect4 model under slot
-  gridPart: BasePart,          -- The part used for size/orientation
-  slotName: string,            -- slotModel.Name (for logs)
-  players: { Player?, Player? }, -- Index 1 = Player 1, Index 2 = Player 2
-  turnIndex: number,           -- 1 or 2 (whose turn)
-  board: number[][],           -- ROWS x COLS; each cell stores player.UserId or nil
-  hitboxFolder: Folder?,       -- Column click parts
-  timerTurnId: number,         -- Increment to invalidate active timers
-  busy: boolean,               -- Move animation in progress
-  acceptMoves: boolean,        -- Are clicks processed as moves
-  countdownId: number,         -- Increment to invalidate countdown
-  matchActive: boolean,        -- True between start & end
-  preMatchCountdown: boolean?, -- True during countdown
-  originalStats: { [Player] = { ws: number, jp: number } },
-  seats: { Seat?, Seat? }?,    -- Two chosen seat instances
-  locked: boolean?,            -- Seat lock state
-  lockPlayers: (session, bool) -> (),
-  endMatch: (session, winner: Player?, loser: Player?, reason: string) -> (),
+  slotModel, connect4Model,
+  gridPart, refPart,
+  players = {p1, p2},
+  turnIndex = 1|2,
+  board = 6x7 matrix (userId|nil),
+  hitboxFolder,
+  timerTurnId,
+  countdownId,
+  matchActive, preMatchCountdown,
+  busy, acceptMoves,
+  seats = {seat1, seat2}, locked,
+  originalStats = { [Player] = {ws, jp} },
+  _winHighlighting
 }
 ```
-### 3.2 Board Representation
-```
-ROWS = 6, COLS = 7
-board[row][col] = player.UserId | nil
-Top row index = 1 (visually top), bottom = 6.
-```
-### 3.3 Reasons Passed to `endMatch`
-`"win" | "draw" | "timeout" | "abort"`
 
 ---
-## 4. Geometry & Placement Logic
-### 4.1 Orientation Detection
+## 4. Geometry & Alignment
+`refPart` = `Alignment` (if present) else `Grid`. All math uses `refPart.CFrame` & `Size`.
+Orientation: `columnsAlongZ(size)` picks the wider horizontal axis.
+Column center along axis:
 ```
-columnsAlongZ(size: Vector3) -> boolean
-  returns true if size.Z > size.X
-  If true: columns extend along world Z using grid.CFrame.LookVector as column axis.
-  Else: columns extend along world X using grid.CFrame.RightVector.
+width  = (alongZ and size.Z) or size.X
+cellW  = width / 7
+along(c) = -width/2 + (c - 0.5) * cellW
 ```
-This allows rotated boards (wide dimension decides horizontal axis).
+Tokens & hitboxes are centered in thickness; `FrontOffset` (attribute, studs) moves them along outward normal (positive toward players). Default = 0.
 
-### 4.2 Column Hitbox Size & Position
-In `ensureHitboxes(session)`:
+Vertical cell center:
 ```
-local size = grid.Size
-local alongZ = columnsAlongZ(size)
-local width  = alongZ and size.Z or size.X    -- horizontal span for 7 columns
-local depth  = alongZ and size.X or size.Z    -- board thickness (front-back)
-local cellW  = width / COLS                   -- column slice width
-local planeDepth = 0.45                       -- thickness of the hitbox plane Part
-local height = size.Y + 2                     -- extend slightly above/below board
+cellH = size.Y/6
+localY(r) = size.Y/2 - (r - 0.5) * cellH
 ```
-Per column `c` (1..7):
-1. Compute column center lateral offset: `along = -width/2 + (c - 0.5) * cellW` (centers each slice).  
-2. Use `columnSpawnCFrame(grid, c, frontOffset, heightAbove)` with `frontOffset ≈ 0.02` and `heightAbove = 0` for hitboxes:
-   - That function builds a CFrame at the front face mid-height; then code shifts it down by half the board height to span full height:
-   ```lua
-   local cf = columnSpawnCFrame(grid, c, 0.02, 0) * CFrame.new(0, -(size.Y/2), 0)
-   ```
-3. Size: 
-   - If alongZ: `Size = Vector3.new(planeDepth, height, cellW)`
-   - Else:      `Size = Vector3.new(cellW, height, planeDepth)`
-
-### 4.3 Token Drop Spawn & Target Positions
-Two helper functions:
-```
-columnSpawnCFrame(grid, col, frontOffset, heightAbove)
-cellWorldCFrame(grid, row, col, frontOffset)
-```
-Shared math with orientation. For a given column:
-- Horizontal offset identical to hitbox: `along = -width/2 + (col - 0.5) * cellW`.
-- Vertical (spawn): board top + `heightAbove` (e.g. 5 studs) for aesthetic drop animation.
-- Target vertical for a cell (row): `yLocal = size.Y/2 - (row - 0.5) * cellH` where `cellH = size.Y / ROWS`.
-  - Row 1 (top) gets small downward offset; row 6 (bottom) is near `-size.Y/2 + cellH/2`.
-- Normal direction (front) uses the narrow dimension so tokens and hitboxes sit just in front of holes: `normal = alongZ and right or look` then offset by `(depth/2 + frontOffset)`.
-- Final token front offset: typically `frontOffset = 0.05` to prevent z‑fighting with board surface.
-
-### 4.4 Y-Axis (Vertical) Token Placement Formula
-Given:
-```
-cellH = size.Y / ROWS
-row in [1..6]
-localY(row) = size.Y/2 - (row - 0.5) * cellH
-worldPos = grid.CFrame.Position + columnAxis*along + up*localY + normal*(depth/2 + frontOffset)
-```
-This creates evenly spaced centers distributed from top to bottom inside the board's vertical span.
-
-### 4.5 Animation
-`pivotTween(model, targetCF, duration)` performs a manual Heartbeat Lerp from current pivot to target. Duration scales slightly with drop depth:
-```
-0.35 + (ROWS - dropRow) * 0.03
-```
-So lower (deeper) placements fall a bit longer for a subtle effect.
 
 ---
-## 5. Token Logic & Skins
-- Tokens cloned from `ReplicatedStorage/Tokens/<SkinName>`.
-- If a token source is a single `BasePart`, it's wrapped into a new `Model` with `PrimaryPart` set.
-- Duplicate skin resolution: if both players picked same skin and player 2 places a token, a hue shift (`+0.05` in HSV) is applied via `setModelHueShift` across all BaseParts.
-- Fallback cylinder generated if model not found: 1.8x1.8x0.4, colored red/yellow.
+## 5. Token Placement & Animation
+Spawn CFrame: above column (heightAbove=5). Target: `cellWorldCFrame` with same `FrontOffset`.
+Animation: manual Heartbeat Lerp in `pivotTween` (duration scales with drop depth: `0.35 + (ROWS - row)*0.03`).
 
 ---
-## 6. Turn & Timing Flow
-1. After countdown completes: `matchActive = true`, `turnIndex = 1`, tokens folder cleared.
-2. `startTurnTimer(session)` sets `timerTurnId` and runs a loop: 25s passive wait + 10s warning (per-second narration). (There is also a simplified in-click spawn timer in earlier code path—avoid duplication if refactoring.)
-3. Player clicks a column Part:
-   - Validations: session active, right player turn, column not full, not busy.
-   - Determine lowest empty row scanning bottom-up.
-   - Spawn and animate token.
-   - Update board: `board[row][col] = player.UserId`.
-   - Win check (`checkWinAt`): four-in-a-row search across directions `{(0,1),(1,0),(1,1),(1,-1)}` symmetrical expansion.
-   - On win: `endMatch(session, winner, loser, "win")`.
-   - On draw: `endMatch(..., "draw")`.
-   - Otherwise: switch `turnIndex = 3 - turnIndex`, reset `busy`, increment `timerTurnId` to cancel prior timer coroutine.
-
-### Timeout Path
-If time expires: call `endMatch(session, other, cur, "timeout")` naming opponent as winner.
+## 6. Turn Flow & Timer (Skip‑Turn Timeout)
+1. Countdown (5..1) when both seats occupied.
+2. Match starts: lock seats, clear tokens, `turnIndex=1`, start turn timer.
+3. Turn timer: 25s passive + 10s warning (per‑second narration). If no move: announce timeout, flip turn, start new timer (board unchanged).
+4. Player click: validate -> find lowest empty row -> spawn & animate token -> write board -> win/draw check -> switch turn & start new timer if game continues.
 
 ---
-## 7. Seat Locking & Lifecycle
-- Seats chosen: two nearest `Seat` / `VehicleSeat` descendants to `gridPart`.
-- Lock occurs only when match actually starts (after countdown), not during countdown.
-- Locking (`lockPlayers(session, true)`):
-  - Forces occupant seat via `Seat:Sit(hum)`.
-  - Stores original WalkSpeed/JumpPower in `session.originalStats[player]`.
-  - Sets WalkSpeed=0, JumpPower=0, anchors `HumanoidRootPart`.
-- Heartbeat loop (every 0.25s) re-applies these constraints while `session.locked`.
-- Unlock after match end: restores saved movement + unanchors winner; loser is killed (Humanoid.Health=0). Both seats forced to release occupants (Humanoid.Sit = false) after unlock.
+## 7. Win Detection & Highlight
+`checkWinAt` returns `(won, chain)` where `chain` = array of `{row,col}` (≥4). On win:
+* If `Highlight` exists: clone onto each winning token, tween FillTransparency 1→0.5 & OutlineTransparency 1→0 (≈0.4s).
+* After 1.5s delay call `endMatch(...,'win')`.
 
 ---
-## 8. Match Ending
-`endMatch(session, winner, loser, reason)` responsibilities:
-- Guard against re-entry via `session.matchActive` flag.
-- Turn off input: `acceptMoves = false`.
-- Increment `timerTurnId` to invalidate timers.
-- Per-player narration (win, lose, timeout, draw, abort).
-- Kill loser when applicable.
-- Immediate unlock & seat release.
-- Delayed (3s) board reset: clear spawned tokens, create new empty board & reset turn to 1, update capacity label.
-
-Reasons mapping:
-| Reason    | Winner Required | Loser Required | Notes |
-|-----------|-----------------|----------------|-------|
-| win       | yes             | yes            | 4-in-a-row detected |
-| draw      | no              | no             | Board full with no winner |
-| timeout   | yes             | yes            | Active player exceeded timer |
-| abort     | no              | no             | A player left mid-match |
+## 8. Seat Locking
+Locked state: seat enforced, WalkSpeed=0, JumpPower=0, HumanoidRoot anchored (loop reasserts every 0.25s). Unlock & stat restore on match end.
 
 ---
-## 9. Narration System
-- `Narrate` RemoteEvent payload: `{ slotId, text }`.
-- `narrateTo(session, msg)` sends identical text to both players.
-- `narrateCustom(session, { msgP1, msgP2 })` allows per-player variant messaging.
-
-Possible future enhancement: add spectator GUI filtering by slot.
+## 9. Camera System
+Server fires `MatchCamera` with actions:
+* `Focus` – client switches to Scriptable cam, positions behind/in front (depending on orientation) & hides characters (transparency).
+* `Reset` – client restores camera & player visibility.
 
 ---
-## 10. Debug & Flags
-| Flag | Location | Purpose |
-|------|----------|---------|
-| `SHOW_COLUMN_ZONES` | top of server script | Set column hitboxes visible/semi-transparent for UX/testing |
-| `DEBUG_CELL_MARKERS`| top of server script | Spawns colored 0.4-stud cubes at each cell center |
+## 10. Match End
+`endMatch(session, winner, loser, reason)` handles narration, camera reset, loser elimination (if applicable), unlock, delayed board reset (3s). Reasons now effectively: `win`, `draw`, `abort` (timeout is non‑terminal: handled earlier as skip).
 
-Extensive `print` statements exist for: countdown ticks, match start, turn switches, clicks, move acceptance, win/draw detection.
-
----
-## 11. Error History & Fixes (For Context)
-| Issue | Cause | Fix |
-|-------|-------|-----|
-| `endMatch` nil during win | Functions defined after sessions captured nil | Moved definitions earlier & assigned during session init |
-| Post-win cleanup nil call (updateCapacityText) | Forward declaration overshadowed by new local function | Rebinding: `updateCapacityText = function(...)` |
-| Loser not killed / winner stuck | Unlock executed after delayed cleanup & nil call abort | Immediate unlock in `endMatch`, loser Humanoid health set, seat release |
-| Seats locked during countdown | Lock invoked too early | Moved lock to only after countdown completion |
+Reason table:
+| Reason | Notes |
+|--------|-------|
+| win    | Highlight chain then delayed finalize |
+| draw   | Board full, no chain |
+| abort  | Player left mid‑match |
+| timeout (legacy) | Replaced by skip-turn logic |
 
 ---
-## 12. Extending the System
-### Add Spectators
-- Add `Spectators` list; only allow clicks from `session.players`.
-- Provide GUI board state via remote for viewers.
-
-### Add Score Tracking
-- Maintain `leaderstats` or DataStore keyed by player.UserId -> wins/losses.
-- Increment in `endMatch` based on reason == "win" or "timeout".
-
-### Add Column Preview
-- On hover, place a translucent token above column (client prediction) using additional RemoteEvent or local raycast from mouse.
-
-### Add Anti-Abuse
-- Track rapid seat swapping; add cooldown.
-- Only start countdown if both players remain seated for N seconds.
-
-### Save/Load Skins
-- Players set `TokenSkin` attribute via a secure server handler to prevent spoofing.
+## 11. Narration
+`Narrate` RemoteEvent; helpers: `narrateTo` (same msg) & `narrateCustom` (per‑player). Warning countdown & timer messages originate server‑side.
 
 ---
-## 13. Key Helper Functions (Concise Reference)
-| Function | Summary |
+## 12. Flags / Debug
+| Flag | Purpose |
+|------|---------|
+| SHOW_COLUMN_ZONES | Visualize clickable columns (semi‑transparent ForceField parts) |
+| DEBUG_CELL_MARKERS| Spawn per-cell neon cubes |
+| DEBUG_GEOMETRY    | Prints geometry build & column centers |
+
+---
+## 13. Key Functions (Reference)
+| Function | Purpose |
 |----------|---------|
-| `getTwoSeatsForSlot(slot, grid)` | Picks two nearest seat instances to grid part |
-| `newBoard()` | Returns fresh 6x7 nil matrix |
-| `checkWinAt(board, row, col, userId)` | Detects 4 in a line around last move |
-| `isBoardFull(board)` | True if no nil cells |
-| `columnsAlongZ(size)` | Orientation decision (horizontal axis) |
-| `cellWorldCFrame(grid, row, col, frontOffset)` | Target token center transform |
-| `columnSpawnCFrame(grid, col, frontOffset, heightAbove)` | Spawn/drop start transform |
-| `ensureHitboxes(session)` | Creates/attaches column click Parts |
-| `startTurnTimer(session)` | Handles 25s + 10s warning phase and timeout resolution |
-| `lockPlayers(session, bool)` | Freeze/unfreeze players & anchor |
-| `endMatch(session, winner, loser, reason)` | Terminate match, narration, cleanup |
-| `narrateTo` / `narrateCustom` | Broadcast messages to players |
+| getTwoSeatsForSlot | Nearest two seats to grid |
+| newBoard | Fresh 6x7 nil matrix |
+| checkWinAt | Returns (won, chain) |
+| isBoardFull | Board filled? |
+| columnsAlongZ | Decide horizontal axis |
+| cellWorldCFrame / columnSpawnCFrame | Token target / spawn transforms |
+| ensureHitboxes | Build column Parts (centered) |
+| startTurnTimer | Unified 25s + 10s warning + skip-turn on timeout |
+| highlightWin | Tween highlight & delayed endMatch |
+| lockPlayers | Seat freeze/restore |
+| endMatch | Finalize match & cleanup |
 
 ---
 ## 14. Coordinate Cheat Sheet
 ```
-width = (columnsAlongZ and grid.Size.Z) or grid.Size.X
+width = (alongZ and size.Z) or size.X
 cellW = width / 7
-cellH = grid.Size.Y / 6
-along(col) = -width/2 + (col - 0.5) * cellW
-vertical(row) = grid.Size.Y/2 - (row - 0.5) * cellH
-spawn heightAbove = typically 5 studs (drop animation start)
-front offset ≈ 0.02..0.05 (hitbox/token separation from board face)
-```
-Vectors extracted from `grid.CFrame`:
-```
-right = cf.RightVector
-look  = cf.LookVector
-up    = cf.UpVector
-columnAxis = columnsAlongZ and look or right
-normal     = columnsAlongZ and right or look   -- points outward through holes
+cellH = size.Y / 6
+along(c) = -width/2 + (c - 0.5)*cellW
+localY(r) = size.Y/2 - (r - 0.5)*cellH
+FrontOffset (attr) shifts along outward normal (default 0)
 ```
 
 ---
-## 15. Adding a New Slot at Runtime
-1. Duplicate an existing slot model (must include `Connect4` + a `Grid` part + 2 seats).
-2. Parent it under `Workspace.PlayingSlots`.
-3. Server auto-detects via `ChildAdded` and initializes session.
+## 15. Adding a Slot
+Duplicate an existing slot (with seats + Connect4/Grid). Parent under `Workspace.PlayingSlots`. System auto‑initializes.
 
 ---
-## 16. Safety & Integrity Notes
-- All move validation occurs server-side.
-- Clients only send implicit input via ClickDetector (Roblox handles origin). No remote for moves reduces exploit surface.
-- Seat enforcement during match prevents players from circumventing turn timer by leaving.
-- Consider throttling click spam with a short per-player debounce if needed.
+## 16. Security Notes
+No remote for moves (ClickDetectors handled by Roblox). All validation server‑side. Seat locking prevents timer abuse. Consider rate limiting if players spam clicks (current busy flag covers animation overlap).
 
 ---
-## 17. Cleanup Tasks (Optional Future Refactor)
-- Remove legacy/duplicate timer code inside click handler (currently a lightweight alternative to `startTurnTimer`). Use single unified timer.
-- Convert `pivotTween` to TweenService tween for smoother motion & ease-in.
-- Replace prints with a debug flag wrapper or a lightweight logging module.
-- Factor geometry helpers into a separate module for reuse/testing.
+## 17. Future Enhancements (Optional)
+* Spectator UI & board replication
+* Persistent scoring (leaderstats/DataStore)
+* Preview ghost token on hover
+* Modularize geometry & timer logic into separate ModuleScripts
+* TweenService token drops & easing camera
+* Logging abstraction replacing raw prints
 
 ---
-## 18. Quick Start (Deployment)
-1. Ensure the model hierarchy matches the layout above.
-2. Provide at least `Red` and `Yellow` token models under `ReplicatedStorage/Tokens`.
-3. Place the script at `ServerScriptService/Server/Connect4.server.luau`.
-4. Start play; sit two players in the slot seats.
+## 18. Quick Deployment
+1. Provide token models under `ReplicatedStorage/Tokens` (Red, Yellow).
+2. (Optional) Add `Highlight` instance for win chain effect.
+3. Add or adjust `Alignment` part and set `FrontOffset` attribute if needed.
+4. Run the place; sit two players; play.
 
 ---
-## 19. Glossary
-| Term | Definition |
-|------|------------|
-| Slot | A physical table environment containing one Connect4 game instance |
-| Session | Runtime state container per slot |
-| Board | 2D array storing userIds per cell |
-| Token | Model or part representing a placed disc |
-| Hitbox | Invisible/semi-transparent clickable plane mapping to a column |
-| Countdown | 5-second pre-match timer when both seats filled |
-| Lock | State where seated players cannot move or jump |
-
----
-## 20. Minimal Pseudocode Summary
+## 19. Pseudocode Summary
 ```
-for slot in PlayingSlots: initSlot(slot)
-  resolve gridPart
-  session = new session state
-  ensureHitboxes(session)
-  hook seat.Occupant changed -> onSeatsChanged
-
-onSeatsChanged:
-  update players
-  if matchActive: enforce seating or abort
-  elseif countdown and a seat empties: cancel
-  elseif two players and idle: start 5s countdown
-
-Countdown finished -> start match:
-  reset board, lock seats, accept moves, start turn timer
-
-Click column:
-  validate + find dropRow
-  animate token placement
-  win? endMatch(win)
-  draw? endMatch(draw)
-  else switch turn + reset timer
-
-endMatch:
-  mark inactive, narration, loser kill, unlock seats, delayed board reset
+initSlot -> build session, hitboxes, seat hooks
+onSeatsChanged -> manage countdown / abort / start match
+startTurnTimer -> wait -> warn -> skip-turn if still idle
+click column -> validate -> place token -> win? highlight -> end; draw? end; else switch turn + timer
+highlightWin -> tween -> delayed endMatch
+endMatch -> narration, camera reset, unlock, delayed board reset
 ```
 
 ---
-## 21. License / Attribution
-(Adjust if you intend to publish. Currently unspecified; treat as proprietary or add an open license header.)
+## 20. License
+Add a license file (currently unspecified).
 
 ---
-**End of Guide**
+End of Final Guide
+

@@ -165,22 +165,79 @@ local function inBounds(r, c)
     return r >= 1 and r <= ROWS and c >= 1 and c <= COLS
 end
 
+-- Extended: now returns (won:boolean, chain: { {r,c}... } ) for the first 4+ direction found
 local function checkWinAt(board, row, col, playerId)
     local dirs = { {0,1}, {1,0}, {1,1}, {1,-1} }
     for _, d in ipairs(dirs) do
         local dr, dc = d[1], d[2]
-        local count = 1
+        local chain = { {row, col} }
+        -- forward
         local r, c = row + dr, col + dc
         while inBounds(r, c) and board[r][c] == playerId do
-            count = count + 1; r = r + dr; c = c + dc
+            table.insert(chain, {r, c}); r = r + dr; c = c + dc
         end
+        -- backward
         r, c = row - dr, col - dc
         while inBounds(r, c) and board[r][c] == playerId do
-            count = count + 1; r = r - dr; c = c - dc
+            table.insert(chain, {r, c}); r = r - dr; c = c - dc
         end
-        if count >= 4 then return true end
+        if #chain >= 4 then
+            return true, chain
+        end
     end
-    return false
+    return false, nil
+end
+
+-- Highlight a winning chain before ending the match (1.5s delay)
+local function highlightWin(session, chain, winner, loser)
+    if session._winHighlighting then return end
+    session._winHighlighting = true
+    session.acceptMoves = false
+    session.busy = false
+    session.timerTurnId += 1 -- cancel any turn timers
+    local rs = ReplicatedStorage
+    local hlTemplate = rs:FindFirstChild("Highlight")
+    if not (hlTemplate and hlTemplate:IsA("Highlight")) then
+        -- Fallback: no template, end immediately
+        if session.endMatch then
+            session.endMatch(session, winner, loser, "win")
+        end
+        return
+    end
+    local tokenFolder = session.connect4Model:FindFirstChild("SpawnedTokens")
+    local spawned = {}
+    if tokenFolder then
+        for _, pos in ipairs(chain) do
+            local r, c = pos[1], pos[2]
+            local name = ("Token_%d_%d"):format(r,c)
+            local token = tokenFolder:FindFirstChild(name)
+            if token then
+                local hl = hlTemplate:Clone()
+                -- Try adornee: prefer model PrimaryPart then first BasePart descendant
+                local adornee = token.PrimaryPart
+                if not adornee then
+                    adornee = token:FindFirstChildWhichIsA("BasePart", true)
+                end
+                hl.FillTransparency = 1
+                hl.OutlineTransparency = 1
+                hl.Adornee = adornee
+                hl.Parent = token
+                table.insert(spawned, hl)
+            end
+        end
+    end
+    -- Tween transparencies
+    local tweenInfo = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    for _, hl in ipairs(spawned) do
+        local tween = TweenService:Create(hl, tweenInfo, { FillTransparency = 0.5, OutlineTransparency = 0 })
+        tween:Play()
+    end
+    -- After 1.5s finalize match
+    task.delay(1.5, function()
+        if session.endMatch and session.matchActive then
+            session.endMatch(session, winner, loser, "win")
+        end
+    end)
 end
 
 local function isBoardFull(board)
@@ -299,6 +356,8 @@ function endMatch(session, winner, loser, reason)
         session.turnIndex = 1
         updateCapacityText(session)
         session.preMatchCountdown = false
+    -- Allow future matches to highlight again
+    session._winHighlighting = false
     end)
     print("[Connect4]["..session.slotName.."] Match end reason="..tostring(reason).." winner="..(winner and winner.Name or "-").." loser="..(loser and loser.Name or "-") )
 end
@@ -626,24 +685,18 @@ local function ensureHitboxes(session)
             m:PivotTo(spawnCF)
             pivotTween(m, targetCF, 0.35 + (ROWS - dropRow) * 0.03)
             board[dropRow][col] = player.UserId
-            if checkWinAt(board, dropRow, col, player.UserId) then
+            local won, chain = checkWinAt(board, dropRow, col, player.UserId)
+            if won then
                 print("[Connect4]["..session.slotName.."] WIN by="..player.Name)
                 local winner = player
                 local loser = (idx == 1) and session.players[2] or session.players[1]
-                session.busy = false -- clear busy so fallback still allows logic
-                print("[Connect4]["..session.slotName.."] Attempting endMatch; matchActive="..tostring(session.matchActive).." endMatchFn="..tostring(session.endMatch))
-                if session.endMatch then
-                    session.endMatch(session, winner, loser, "win")
+                -- If highlight available, run highlightWin (delays endMatch). Otherwise immediate.
+                if chain then
+                    highlightWin(session, chain, winner, loser)
                 else
-                    -- Fallback minimal cleanup
-                    narrateTo(session, winner.DisplayName .. " wins!")
-                    session.acceptMoves = false
-                    session.matchActive = false
-                    task.delay(3, function()
-                        getTokensFolder(session.connect4Model):ClearAllChildren()
-                        session.board = newBoard()
-                        session.turnIndex = 1
-                    end)
+                    if session.endMatch then
+                        session.endMatch(session, winner, loser, "win")
+                    end
                 end
                 return
             end
@@ -775,6 +828,7 @@ local function onSeatsChanged(session, seats)
             -- Start match: now lock seats
             session.board = newBoard()
             session.turnIndex = 1
+            session._winHighlighting = false -- reset highlight guard for new match
             local folder = getTokensFolder(session.connect4Model)
             folder:ClearAllChildren()
             session.acceptMoves = true
