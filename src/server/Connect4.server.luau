@@ -24,11 +24,18 @@ if not Narrate then
     Narrate.Name = "Narrate"
     Narrate.Parent = remotesFolder
 end
+local MatchCamera = remotesFolder:FindFirstChild("MatchCamera")
+if not MatchCamera then
+    MatchCamera = Instance.new("RemoteEvent")
+    MatchCamera.Name = "MatchCamera"
+    MatchCamera.Parent = remotesFolder
+end
 
 local TOKENS = ReplicatedStorage:WaitForChild("Tokens")
 local ROWS, COLS = 6, 7
 local SHOW_COLUMN_ZONES = true -- visualize clickable column areas (for debugging/UX)
 local DEBUG_CELL_MARKERS = false -- set true to spawn small parts at each cell center
+local DEBUG_GEOMETRY = true -- set true to print geometry calculations for hitboxes
 
 -- Choose the two seats closest to the grid part for this slot
 local function getTwoSeatsForSlot(slotModel, gridPart)
@@ -75,6 +82,16 @@ local function narrateCustom(session, map)
             if txt then
                 Narrate:FireClient(p, { slotId = session.slotName, text = txt })
             end
+        end
+    end
+end
+
+local function sendCameraEvent(session, action)
+    local rp = session.refPart or session.gridPart
+    if not rp then return end
+    for _, pl in ipairs(session.players) do
+        if pl then
+            MatchCamera:FireClient(pl, { slotId = session.slotName, action = action, cf = rp.CFrame, size = rp.Size })
         end
     end
 end
@@ -246,6 +263,8 @@ function endMatch(session, winner, loser, reason)
     else
         narrateTo(session, msg)
     end
+    -- Reset camera for participants
+    sendCameraEvent(session, "Reset")
     if loser and loser.Character then
         local hum = loser.Character:FindFirstChildOfClass("Humanoid")
         if hum then hum.Health = 0 end
@@ -334,12 +353,14 @@ local function columnsAlongZ(size: Vector3): boolean
     return size.Z > size.X
 end
 
+-- Token / cell world CFrame helpers
+-- New semantics: frontOffset is now relative to the CENTER of the board thickness (same as hitboxes),
+-- not an offset from the front face. (So 0 => geometric center, positive pushes toward the board's normal.)
 local function cellWorldCFrame(grid, row, col, frontOffset)
     frontOffset = frontOffset or 0
     local size = grid.Size
     local alongZ = columnsAlongZ(size)
     local width = alongZ and size.Z or size.X
-    local depth = alongZ and size.X or size.Z
     local cellW = width / COLS
     local cellH = size.Y / ROWS
     local along = -width/2 + (col - 0.5) * cellW
@@ -350,7 +371,7 @@ local function cellWorldCFrame(grid, row, col, frontOffset)
     local up = cf.UpVector
     local columnAxis = alongZ and look or right
     local normal = alongZ and right or look
-    local pos = cf.Position + columnAxis * along + up * yLocal + normal * (depth/2 + frontOffset)
+    local pos = cf.Position + columnAxis * along + up * yLocal + normal * frontOffset
     return CFrame.lookAt(pos, pos + normal, up)
 end
 
@@ -360,7 +381,6 @@ local function columnSpawnCFrame(grid, col, frontOffset, heightAbove)
     local size = grid.Size
     local alongZ = columnsAlongZ(size)
     local width = alongZ and size.Z or size.X
-    local depth = alongZ and size.X or size.Z
     local cellW = width / COLS
     local along = -width/2 + (col - 0.5) * cellW
     local cf = grid.CFrame
@@ -369,7 +389,7 @@ local function columnSpawnCFrame(grid, col, frontOffset, heightAbove)
     local up = cf.UpVector
     local columnAxis = alongZ and look or right
     local normal = alongZ and right or look
-    local pos = cf.Position + columnAxis * along + up * (size.Y/2 + heightAbove) + normal * (depth/2 + frontOffset)
+    local pos = cf.Position + columnAxis * along + up * (size.Y/2 + heightAbove) + normal * frontOffset
     return CFrame.lookAt(pos, pos + normal, up)
 end
 
@@ -404,6 +424,16 @@ local function resolveGridPart(connect4Model)
     return connect4Model:FindFirstChildWhichIsA("BasePart", true)
 end
 
+-- Find alignment reference: only a direct child named 'Alignment' under the 'Grid' model (no deep or variant search)
+local function findAlignmentPart(connect4Model, gridPart)
+    local gridContainer = connect4Model:FindFirstChild("Grid")
+    if gridContainer then
+        local a = gridContainer:FindFirstChild("Alignment")
+        if a and a:IsA("BasePart") then return a end
+    end
+    return nil
+end
+
 local function createDebugCells(session)
     if not DEBUG_CELL_MARKERS then return end
     if session.debugCellsFolder and session.debugCellsFolder.Parent then return end
@@ -413,7 +443,7 @@ local function createDebugCells(session)
     session.debugCellsFolder = folder
     for r=1, ROWS do
         for c=1, COLS do
-            local cf = cellWorldCFrame(session.gridPart, r, c, 0.4)
+            local cf = cellWorldCFrame(session.refPart or session.gridPart, r, c, 0.4)
             local part = Instance.new("Part")
             part.Name = ("Cell_%d_%d"):format(r,c)
             part.Size = Vector3.new(0.4,0.4,0.4)
@@ -427,11 +457,43 @@ local function createDebugCells(session)
     end
 end
 
+-- Turn timer (placed before ensureHitboxes so click handler can call it)
+local function startTurnTimer(session)
+    session.timerTurnId = session.timerTurnId + 1
+    local myId = session.timerTurnId
+    print("[Connect4]["..session.slotName.."] Turn timer start id="..myId.." turn="..session.turnIndex)
+    task.spawn(function()
+        local waited = 0
+        while waited < 25 do
+            if myId ~= session.timerTurnId then return end
+            waited += 0.5
+            task.wait(0.5)
+        end
+        print("[Connect4]["..session.slotName.."] Base 25s elapsed; 10s warning phase")
+        for t = 10, 1, -1 do
+            if myId ~= session.timerTurnId then return end
+            local cur = session.players[session.turnIndex]
+            if not cur then return end
+            narrateTo(session, string.format("%s: %d seconds to move...", cur.DisplayName, t))
+            task.wait(1)
+        end
+        if myId ~= session.timerTurnId then return end
+        local cur = session.players[session.turnIndex]
+        local other = session.players[3 - session.turnIndex]
+        if cur and other then
+            narrateTo(session, string.format("%s ran out of time. Turn passes to %s.", cur.DisplayName, other.DisplayName))
+            session.turnIndex = 3 - session.turnIndex
+            session.timerTurnId += 1
+            startTurnTimer(session)
+        end
+    end)
+end
+
 local function ensureHitboxes(session)
     if session.hitboxFolder and session.hitboxFolder.Parent ~= nil then
         return
     end
-    local grid = session.gridPart
+    local grid = session.refPart or session.gridPart
     local connect4Model = session.connect4Model
     local hbFolder = Instance.new("Folder")
     hbFolder.Name = "ColumnHitboxes"
@@ -440,9 +502,22 @@ local function ensureHitboxes(session)
     local alongZ = columnsAlongZ(size)
     local width = alongZ and size.Z or size.X
     local depth = alongZ and size.X or size.Z
+    -- Fallback: if chosen width is extremely thin (<= planeDepth * 1.1), swap axes to avoid overlapping hitboxes
+    local planeDepthFallback = 0.45
+    if width <= planeDepthFallback * 1.1 then
+        alongZ = not alongZ
+        width = alongZ and size.Z or size.X
+        depth = alongZ and size.X or size.Z
+        if DEBUG_GEOMETRY then
+            print("[Connect4]["..session.slotName.."] Width too small for columns; swapping axis. New alongZ="..tostring(alongZ).." width="..tostring(width).." depth="..tostring(depth))
+        end
+    end
     local cellW = width / COLS
     local planeDepth = 0.45
     local height = size.Y + 2
+    if DEBUG_GEOMETRY then
+        print( string.format("[Connect4][%s] Build hitboxes refPart=%s size=(%.3f,%.3f,%.3f) alongZ=%s width=%.3f depth=%.3f cellW=%.3f", session.slotName, grid.Name, size.X,size.Y,size.Z, tostring(alongZ), width, depth, cellW) )
+    end
     for c = 1, COLS do
         local hit = Instance.new("Part")
         hit.Name = "ColHitbox_" .. c
@@ -459,10 +534,30 @@ local function ensureHitboxes(session)
         else
             hit.Size = Vector3.new(cellW, height, planeDepth)
         end
-        local cf = columnSpawnCFrame(grid, c, 0.02, 0) * CFrame.new(0, - (size.Y/2), 0)
-        -- columnSpawnCFrame gives top center; adjust down by half board height to span properly
+        -- Center the hitbox in board thickness instead of pushing it to the front face.
+        -- Optional attribute 'FrontOffset' (studs) on Grid or Alignment can nudge forward/back.
+        local frontOffsetAttr = 0
+        local attrSource = session.refPart or session.gridPart
+        if attrSource and attrSource:GetAttribute("FrontOffset") then
+            frontOffsetAttr = tonumber(attrSource:GetAttribute("FrontOffset")) or 0
+        end
+        -- Recompute column center manually (avoid top-only approach used before)
+        local cfGrid = grid.CFrame
+        local right = cfGrid.RightVector
+        local look = cfGrid.LookVector
+        local up = cfGrid.UpVector
+        local columnAxis = alongZ and look or right
+        local normal = alongZ and right or look
+        local along = -width/2 + (c - 0.5) * cellW
+        local normalOffset = frontOffsetAttr -- 0 means geometric center of board thickness
+        local centerPos = cfGrid.Position + columnAxis * along + normal * normalOffset
+        local cf = CFrame.lookAt(centerPos, centerPos + normal, up)
         hit.CFrame = cf
         hit.Parent = hbFolder
+        if DEBUG_GEOMETRY then
+            local pos = cf.Position
+            print(string.format("[Connect4][%s] Col %d center (%.3f, %.3f, %.3f)", session.slotName, c, pos.X,pos.Y,pos.Z))
+        end
         local cd = Instance.new("ClickDetector")
         cd.MaxActivationDistance = 38
         cd.Parent = hit
@@ -481,7 +576,9 @@ local function ensureHitboxes(session)
         end
 
         cd.MouseClick:Connect(function(player)
-            print("[Connect4]["..session.slotName.."] Raw click c="..c.." by="..player.Name.." busy="..tostring(session.busy).." accept="..tostring(session.acceptMoves).." turn="..session.turnIndex)
+            -- Always use latest reference part (alignment) for placement math
+            local refGrid = session.refPart or session.gridPart
+            print("[Connect4]["..session.slotName.."] Raw click c="..c.." by="..player.Name.." busy="..tostring(session.busy).." accept="..tostring(session.acceptMoves).." turn="..session.turnIndex .." refPart="..refGrid.Name)
             if session.busy or not session.acceptMoves then return end
             if player ~= session.players[1] and player ~= session.players[2] then return end
             local idx = (player == session.players[1]) and 1 or 2
@@ -518,8 +615,14 @@ local function ensureHitboxes(session)
             m.Name = ("Token_%d_%d"):format(dropRow,col)
             m.Parent = getTokensFolder(session.connect4Model)
             ensurePrimaryPart(m)
-            local spawnCF = columnSpawnCFrame(grid, col, 0.05, 5)
-            local targetCF = cellWorldCFrame(grid, dropRow, col, 0.05)
+            -- Use the same FrontOffset attribute (relative to center) used for hitboxes so tokens align perfectly
+            local attrSource = session.refPart or session.gridPart
+            local frontOffsetAttr = 0
+            if attrSource and attrSource:GetAttribute("FrontOffset") then
+                frontOffsetAttr = tonumber(attrSource:GetAttribute("FrontOffset")) or 0
+            end
+            local spawnCF = columnSpawnCFrame(refGrid, col, frontOffsetAttr, 5)
+            local targetCF = cellWorldCFrame(refGrid, dropRow, col, frontOffsetAttr)
             m:PivotTo(spawnCF)
             pivotTween(m, targetCF, 0.35 + (ROWS - dropRow) * 0.03)
             board[dropRow][col] = player.UserId
@@ -555,57 +658,60 @@ local function ensureHitboxes(session)
             print("[Connect4]["..session.slotName.."] Turn switched -> "..session.turnIndex)
             local mover = session.players[session.turnIndex]
             if mover then narrateTo(session,("%s is placing their token..."):format(mover.DisplayName)) end
-            task.spawn(function()
-                local myId = session.timerTurnId
-                local waited = 0
-                while waited < 25 do if myId ~= session.timerTurnId then return end waited+=0.5 task.wait(0.5) end
-                for t=10,1,-1 do if myId ~= session.timerTurnId then return end local cur=session.players[session.turnIndex]; if not cur then return end narrateTo(session,("%s: %d seconds to move..."):format(cur.DisplayName,t)) task.wait(1) end
-                if myId ~= session.timerTurnId then return end
-                local cur=session.players[session.turnIndex]; local other=session.players[3-session.turnIndex]
-                if cur and other then narrateTo(session,("%s ran out of time. %s wins!"):format(cur.DisplayName, other.DisplayName)) end
-                session.board=newBoard(); session.turnIndex=1; session.timerTurnId+=1
-                getTokensFolder(session.connect4Model):ClearAllChildren()
-                if session.players[1] and session.players[2] then
-                    narrateTo(session,("%s to move. Place your token."):format(session.players[1].DisplayName))
-                end
-            end)
+            startTurnTimer(session)
         end)
     end
     session.hitboxFolder = hbFolder
     createDebugCells(session)
 end
 
-local function startTurnTimer(session)
-    session.timerTurnId = session.timerTurnId + 1
-    local myId = session.timerTurnId
-    print("[Connect4]["..session.slotName.."] Turn timer start id="..myId.." turn="..session.turnIndex)
-    task.spawn(function()
-        local waited = 0
-        while waited < 25 do
-            if myId ~= session.timerTurnId then return end
-            waited = waited + 0.5
-            task.wait(0.5)
-        end
-        print("[Connect4]["..session.slotName.."] Base 25s elapsed; 10s warning phase")
-        for t = 10, 1, -1 do
-            if myId ~= session.timerTurnId then return end
-            local cur = session.players[session.turnIndex]
-            if not cur then return end
-            narrateTo(session, string.format("%s: %d seconds to move...", cur.DisplayName, t))
-            task.wait(1)
-        end
-        if myId ~= session.timerTurnId then return end
-        local cur = session.players[session.turnIndex]
-        local other = session.players[3 - session.turnIndex]
-        if cur and other then
-            local endMatch = session.endMatch
-            if endMatch then
-                print("[Connect4]["..session.slotName.."] Timeout triggered; winner="..other.Name.." loser="..cur.Name)
-                endMatch(session, other, cur, "timeout")
+-- Re-select alignment reference and rebuild hitboxes if needed
+local function updateRefPart(session)
+    if not session or not session.connect4Model then return end
+    local previous = session.refPart
+    local connect4Model = session.connect4Model
+    local grid = session.gridPart
+    local ref = previous
+    local gridModel = connect4Model:FindFirstChild("Grid")
+    local a = gridModel and gridModel:FindFirstChild("Alignment")
+    if a and a:IsA("BasePart") then
+        ref = a
+    else
+        ref = grid
+    end
+    if ref ~= previous then
+        session.refPart = ref
+        -- Disconnect old watchers
+        if session._refWatch then
+            for _, conn in ipairs(session._refWatch) do
+                if typeof(conn) == "RBXScriptConnection" then conn:Disconnect() end
             end
         end
-    end)
+        session._refWatch = {}
+        if session.hitboxFolder then session.hitboxFolder:Destroy(); session.hitboxFolder = nil end
+        if session.debugCellsFolder then session.debugCellsFolder:Destroy(); session.debugCellsFolder = nil end
+        print("[Connect4]["..session.slotName.."] Alignment reference changed -> "..ref.Name)
+        ensureHitboxes(session)
+        if DEBUG_CELL_MARKERS then createDebugCells(session) end
+        -- Attach live tracking for movement / resize to rebuild geometry
+        local function attachWatch(prop)
+            local ok, sig = pcall(function() return ref:GetPropertyChangedSignal(prop) end)
+            if ok and sig then
+                table.insert(session._refWatch, sig:Connect(function()
+                    -- Rebuild only hitboxes (tokens keep their world positions)
+                    if session.hitboxFolder then session.hitboxFolder:Destroy(); session.hitboxFolder = nil end
+                    if DEBUG_CELL_MARKERS and session.debugCellsFolder then session.debugCellsFolder:Destroy(); session.debugCellsFolder = nil end
+                    ensureHitboxes(session)
+                    if DEBUG_CELL_MARKERS then createDebugCells(session) end
+                end))
+            end
+        end
+        attachWatch("CFrame")
+        attachWatch("Size")
+    end
 end
+
+-- (duplicate startTurnTimer removed; single definition appears earlier)
 
 local function onSeatsChanged(session, seats)
     local p1 = seats[1] and safeGetPlayerFromOccupant(seats[1].Occupant) or nil
@@ -677,6 +783,7 @@ local function onSeatsChanged(session, seats)
             if session.lockPlayers then session.lockPlayers(session, true) end
             local startMsg = string.format("%s to move. Place your token.", p1.DisplayName)
             narrateTo(session, startMsg)
+            sendCameraEvent(session, "Focus")
         print("[Connect4]["..session.slotName.."] Match start. P1="..p1.Name.." P2="..p2.Name)
             startTurnTimer(session)
         end)
@@ -714,10 +821,17 @@ local function initSlot(slotModel)
         return
     end
 
+    -- Optional alignment override: a transparent child part used only for token/grid math
+    local refPart = findAlignmentPart(connect4Model, grid) or grid
+    if refPart ~= grid then
+        print("[Connect4]["..slotModel.Name.."] Using Alignment part '"..refPart.Name.."' for geometry instead of Grid")
+    end
+
     local session = {
         slotModel = slotModel,
         connect4Model = connect4Model,
         gridPart = grid,
+    refPart = refPart, -- geometry reference (Alignment if present else Grid)
         slotName = slotModel.Name,
         players = { nil, nil },
         turnIndex = 1,
@@ -756,6 +870,23 @@ local function initSlot(slotModel)
     end)
 
     ensureHitboxes(session)
+    -- Print initial reference summary
+    local rp = session.refPart or session.gridPart
+    print("[Connect4]["..session.slotName.."] Using refPart="..rp.Name.." size="..tostring(rp.Size).." position="..tostring(rp.Position))
+    -- Watch for alignment part added later
+    connect4Model.DescendantAdded:Connect(function(d)
+        if d:IsA("BasePart") and d.Name == "Alignment" and d.Parent and d.Parent.Name == "Grid" then
+            updateRefPart(session)
+        end
+    end)
+    -- Also if a potential alignment part is removed, revert to grid
+    connect4Model.DescendantRemoving:Connect(function(d)
+        if d == session.refPart then
+            task.defer(function()
+                updateRefPart(session)
+            end)
+        end
+    end)
 
     local seats = getTwoSeatsForSlot(slotModel, grid)
     if #seats < 2 then
