@@ -40,210 +40,164 @@ ServerScriptService/
     Connect4.server.luau  (main system script)
 StarterPlayer/
   StarterPlayerScripts/
-    Connect4.client.luau  (narration listener)
-# Connect4 Multi-Table System – Final Guide
+    ## Project Guide (Technical Deep Dive)
 
-This guide documents the finalized multi‑table Connect 4 implementation (alignment ref part, centered geometry, skip‑turn timeout, camera focus, and win highlighting).
+    This guide complements the top‑level `README.md` by detailing internal data structures, flows, and extension points without repeating high‑level marketing content.
 
----
-## 1. Overview
-Multiple simultaneous games run on physical slot models under `Workspace.PlayingSlots`. Each slot has a `Connect4` model and seats for two players. When both are seated: 5s countdown -> match starts -> seats lock -> players alternate clicks on column hitboxes. System is server‑authoritative.
+    ### 1. Runtime Session Object
+    Stored per slot in `Connect4.server.luau` (fields may evolve):
+    ```
+    session = {
+      slotName: string,
+      slotModel: Model,
+      connect4Model: Model,
+      gridPart: BasePart,      -- original Grid
+      refPart: BasePart,       -- Alignment or Grid (geometry source)
+      players = {p1: Player?, p2: Player?},
+      seats = {Seat?, Seat?},
+      board = 6x7 matrix (userId | nil),
+      turnIndex = 1 | 2,
+      matchActive = false,
+      preMatchCountdown = false,
+      busy = false,            -- token anim in progress
+      acceptMoves = false,     -- gating clicks
+      hitboxFolder: Folder?,
+      countdownId = 0,
+      timerTurnId = 0,
+      locked = false,
+      originalStats = { [Player] = { ws, jp } },
+      _winHighlighting = false,
+    }
+    ```
 
-Key server features:
-* Auto slot discovery & per‑slot session state
-* Alignment override part (`Grid/Alignment`) for geometry (movement/resize live rebuild)
-* Centered column hitboxes & token placement with optional `FrontOffset` attribute
-* Turn timer (25s + 10s warning). Timeout now skips the turn (no immediate end)
-* Win chain detection returning exact coordinates
-* Win highlight tween using `ReplicatedStorage.Highlight` (optional) before ending match
-* Camera focus / reset events (`MatchCamera`) – client handles cinematic view & temporary player transparency
-* Token skins + hue disambiguation for same-skin players
-* Robust seat locking & graceful cleanup
+    ### 2. Geometry Calculations
+    ```
+    width   = (columnsAlongZ and refPart.Size.Z) or refPart.Size.X
+    cellW   = width / 7
+    cellH   = refPart.Size.Y / 6
+    columnX(zIndex) or columnZ(xIndex) -> along(c) = -width/2 + (c - 0.5)*cellW
+    localY(r) = refPart.Size.Y/2 - (r - 0.5)*cellH
+    FrontOffset attribute shifts final world CFrame along outward normal
+    ```
+    Alignment logic picks the wider horizontal axis to decide columns orientation.
 
-Client features:
-* Receives match narration via `Narrate`
-* Camera / transparency handling via `MatchCamera`
+    ### 3. Token Placement Pipeline
+    1. Player click triggers server column handler.
+    2. Validate: in match, correct player, column not full, not busy.
+    3. Find lowest empty row; mark `busy=true`.
+    4. Clone token model (skin variant logic) → pivot above column → Heartbeat lerp to target cell CFrame (drop time scales with depth).
+    5. Mark board cell & release `busy`.
+    6. Check win/draw → highlight or progress turn.
 
----
-## 2. Expected Hierarchy
-```
-ReplicatedStorage/
-  Connect4/
-    Narrate (RemoteEvent)
-    MatchCamera (RemoteEvent)
-  Tokens/
-    Red
-    Yellow
-    <OtherSkinModels>
-  Highlight (Highlight)  -- optional template for win effect
-Workspace/
-  PlayingSlots/
-    <SlotModel>/
-      Connect4/
-        Grid (Part or Model)
-          Alignment (Part, optional precision ref)
-      (Two Seat descendants somewhere under SlotModel)
-ServerScriptService/Server/Connect4.server.luau
-StarterPlayer/StarterPlayerScripts/Connect4.client.luau
-```
-Runtime folders: `SpawnedTokens`, `ColumnHitboxes`, optional `DebugCells`.
+    ### 4. Win Highlight
+    If `ReplicatedStorage.Highlight` exists: clone per token, tween Fill / Outline transparency (≈0.4s), hold 1.5s, then finalize.
 
----
-## 3. Session State
-```
-session = {
-  slotModel, connect4Model,
-  gridPart, refPart,
-  players = {p1, p2},
-  turnIndex = 1|2,
-  board = 6x7 matrix (userId|nil),
-  hitboxFolder,
-  timerTurnId,
-  countdownId,
-  matchActive, preMatchCountdown,
-  busy, acceptMoves,
-  seats = {seat1, seat2}, locked,
-  originalStats = { [Player] = {ws, jp} },
-  _winHighlighting
-}
-```
+    ### 5. Turn Timer & Skip Logic
+    `timerTurnId` increments to invalidate previous timers. Flow: start → wait 15s (silent) → last 10s per‑second warning Narrate fires → if still same turn & no move at 25s mark: timeout narrate & switch turn (board unchanged).
 
----
-## 4. Geometry & Alignment
-`refPart` = `Alignment` (if present) else `Grid`. All math uses `refPart.CFrame` & `Size`.
-Orientation: `columnsAlongZ(size)` picks the wider horizontal axis.
-Column center along axis:
-```
-width  = (alongZ and size.Z) or size.X
-cellW  = width / 7
-along(c) = -width/2 + (c - 0.5) * cellW
-```
-Tokens & hitboxes are centered in thickness; `FrontOffset` (attribute, studs) moves them along outward normal (positive toward players). Default = 0.
+    ### 6. Seat Locking Strategy
+    On match start: store WalkSpeed & JumpPower, zero them, (optionally anchor HRP inside loop). On end: restore values & unanchor. Defensive reapply loop every 0.25s minimizes exploit window.
 
-Vertical cell center:
-```
-cellH = size.Y/6
-localY(r) = size.Y/2 - (r - 0.5) * cellH
-```
+    ### 7. Persistence Model
+    `DataManager` caches profile in memory keyed by UserId. `_dirty` flag triggers periodic save (60s) and on removal/shutdown. Update merges keep max `HighestStreak` and union of `OwnedSkins`.
 
----
-## 5. Token Placement & Animation
-Spawn CFrame: above column (heightAbove=5). Target: `cellWorldCFrame` with same `FrontOffset`.
-Animation: manual Heartbeat Lerp in `pivotTween` (duration scales with drop depth: `0.35 + (ROWS - row)*0.03`).
+    Profile schema:
+    ```
+    { Version=1, Coins, Wins, Streak, HighestStreak, OwnedSkins, _dirty? }
+    ```
 
----
-## 6. Turn Flow & Timer (Skip‑Turn Timeout)
-1. Countdown (5..1) when both seats occupied.
-2. Match starts: lock seats, clear tokens, `turnIndex=1`, start turn timer.
-3. Turn timer: 25s passive + 10s warning (per‑second narration). If no move: announce timeout, flip turn, start new timer (board unchanged).
-4. Player click: validate -> find lowest empty row -> spawn & animate token -> write board -> win/draw check -> switch turn & start new timer if game continues.
+    ### 8. Attributes vs Leaderstats Rationale
+    Attributes (`Coins`, `HighestStreak`, `TokenSkin`) allow silent internal changes and client detection without cluttering scoreboard. Leaderstats limited to `Wins`, `Streak` for social visibility. Migration kept a fallback path (legacy coins IntValue) for older sessions; new logic prefers attributes.
 
----
-## 7. Win Detection & Highlight
-`checkWinAt` returns `(won, chain)` where `chain` = array of `{row,col}` (≥4). On win:
-* If `Highlight` exists: clone onto each winning token, tween FillTransparency 1→0.5 & OutlineTransparency 1→0 (≈0.4s).
-* After 1.5s delay call `endMatch(...,'win')`.
+    ### 9. Token Skins Flow
+    Module `TokenConfig.luau` enumerates all skins + metadata (costCoins, productId placeholders, quests, etc.). Purchase path:
+    ```
+    Client -> RemoteFunction TokenInventory/Request (Purchase, {skin})
+      DataManager.tryPurchase -> cost check -> deduct Coins -> add skin -> mark dirty
+      On success server fires TokenInventory/Purchased (RemoteEvent)
+    Client SkinsUI listens -> rebuilds list instantly
+    Player selects -> Equip action sets Player attribute TokenSkin
+    Server placement uses attribute each token spawn
+    Variant handling: second player same skin -> use variant folder or hue shift
+    ```
 
----
-## 8. Seat Locking
-Locked state: seat enforced, WalkSpeed=0, JumpPower=0, HumanoidRoot anchored (loop reasserts every 0.25s). Unlock & stat restore on match end.
+    ### 10. Coins Display & SFX
+    `CoinsDisplay.luau` binds to `Coins` attribute; animates label size + coin icon rotation on increments. Client SFX logic debounces by timestamp and suppresses first attribute initialization.
 
----
-## 9. Camera System
-Server fires `MatchCamera` with actions:
-* `Focus` – client switches to Scriptable cam, positions behind/in front (depending on orientation) & hides characters (transparency).
-* `Reset` – client restores camera & player visibility.
+    ### 11. Admin Coins Command
+    Parsed in chat by `Connect4.server.luau`:
+    ```
+    /coins add <amt>
+    /coins add <player> <amt>
+    /coins remove <player?> <amt>
+    /coins set <player> <amt>
+    ```
+    Writes directly to Coins attribute then calls `DataManager.setStatFromLeaderstat` for persistence alignment. Only place owner & IDs in `ADMIN_USER_IDS` pass `isAdmin`.
 
----
-## 10. Match End
-`endMatch(session, winner, loser, reason)` handles narration, camera reset, loser elimination (if applicable), unlock, delayed board reset (3s). Reasons now effectively: `win`, `draw`, `abort` (timeout is non‑terminal: handled earlier as skip).
+    ### 12. Debug Flags
+    Set near top of server script:
+    * `SHOW_COLUMN_ZONES` – visualize column hitboxes.
+    * `DEBUG_CELL_MARKERS` – spawn tiny cell center parts.
+    * `DEBUG_GEOMETRY` – geometry prints.
+    * `DEBUG_ALIGNMENT` – alignment pivot details.
 
-Reason table:
-| Reason | Notes |
-|--------|-------|
-| win    | Highlight chain then delayed finalize |
-| draw   | Board full, no chain |
-| abort  | Player left mid‑match |
-| timeout (legacy) | Replaced by skip-turn logic |
+    ### 13. Extension Recipes
+    Add new purchasable skin:
+    1. Add model under `ReplicatedStorage/Tokens/<SkinName>`.
+    2. Add icon `Assets/UITemplates/TokenIcons/<SkinName>`.
+    3. Insert entry in `TokenConfig.luau` with `costCoins`.
+    4. (Optional) Provide variant in `Tokens/Variants/<SkinName>` for second player hue disambiguation.
 
----
-## 11. Narration
-`Narrate` RemoteEvent; helpers: `narrateTo` (same msg) & `narrateCustom` (per‑player). Warning countdown & timer messages originate server‑side.
+    Monetized skin (Developer Product):
+    1. Set `productId` in `TokenConfig`.
+    2. Implement product receipt callback to call `DataManager.addSkin(player, skin)` and `DataManager.markDirty(player)`.
+    3. Fire `Purchased` RemoteEvent to force UI rebuild.
 
----
-## 12. Flags / Debug
-| Flag | Purpose |
-|------|---------|
-| SHOW_COLUMN_ZONES | Visualize clickable columns (semi‑transparent ForceField parts) |
-| DEBUG_CELL_MARKERS| Spawn per-cell neon cubes |
-| DEBUG_GEOMETRY    | Prints geometry build & column centers |
+    Quest skin:
+    1. Define `quest` string in `TokenConfig`.
+    2. Server script: detect quest completion → award via `addSkin`.
 
----
-## 13. Key Functions (Reference)
-| Function | Purpose |
-|----------|---------|
-| getTwoSeatsForSlot | Nearest two seats to grid |
-| newBoard | Fresh 6x7 nil matrix |
-| checkWinAt | Returns (won, chain) |
-| isBoardFull | Board filled? |
-| columnsAlongZ | Decide horizontal axis |
-| cellWorldCFrame / columnSpawnCFrame | Token target / spawn transforms |
-| ensureHitboxes | Build column Parts (centered) |
-| startTurnTimer | Unified 25s + 10s warning + skip-turn on timeout |
-| highlightWin | Tween highlight & delayed endMatch |
-| lockPlayers | Seat freeze/restore |
-| endMatch | Finalize match & cleanup |
+    ### 14. Security Considerations
+    * No RemoteEvent for direct moves; server manipulates board exclusively.
+    * Column hitboxes are server-created; client cannot spoof board placement.
+    * Admin commands limited to curated IDs.
+    * Persistence uses UpdateAsync with merge to avoid overwrite races.
 
----
-## 14. Coordinate Cheat Sheet
-```
-width = (alongZ and size.Z) or size.X
+    ### 15. Performance Notes
+    Board operations are O(ROWS * COLS) in worst case (tiny). Token animation uses simple Heartbeat Lerp (negligible). Potential optimization only if scaling to hundreds of simultaneous slots (pool token models, reduce prints). Current design is adequate for typical experiences.
+
+    ### 16. Future Enhancements (Curated)
+    * Spectator floating GUI showing all active boards.
+    * Ghost preview token + column highlight on hover.
+    * Easing / TweenService based drop (replace manual lerp) with bounce.
+    * Rich post‑match stats panel (coins gained, streak changes).
+    * Anti‑AFK penalty for repeated timeouts.
+    * Batched save queue with jitter to spread DataStore writes.
+
+    ### 17. Minimal Pseudocode Recap
+    ```
+    onSeatStateChanged -> if two occupied & not matchActive -> startCountdown()
+    startCountdown -> after 5s -> beginMatch()
+    beginMatch -> lockPlayers -> resetBoard -> startTurnTimer()
+    onColumnClick -> if acceptMoves -> placeToken -> checkWin/draw -> maybe highlightWin or nextTurn
+    highlightWin -> tween -> delayed endMatch
+    endMatch -> unlock -> reset after short delay
+    ```
+
+    ### 18. Troubleshooting Quick Table
+    | Symptom | Likely Cause | Fix |
+    |---------|-------------|-----|
+    | Skins list empty | UITemplates/Skin mismatch | Verify template & icons folder names |
+    | Coin SFX on join | Attribute init playing sound | Confirm suppression flag (attrInitialized) true |
+    | Purchases delay UI | Missing Purchased RemoteEvent | Ensure `TokenShop.server.luau` fires event |
+    | Second player same skin identical | No variant & no hue shift applied | Add variant model or implement hue shift fallback |
+    | Coins not saving | `_dirty` never set | Use `DataManager.addCoins` / markDirty |
+
+    ### 19. License
+    Still undefined; add a LICENSE file to clarify usage & contributions.
+
+    ---
+    End of technical guide.
 cellW = width / 7
+
 cellH = size.Y / 6
-along(c) = -width/2 + (c - 0.5)*cellW
-localY(r) = size.Y/2 - (r - 0.5)*cellH
-FrontOffset (attr) shifts along outward normal (default 0)
-```
-
----
-## 15. Adding a Slot
-Duplicate an existing slot (with seats + Connect4/Grid). Parent under `Workspace.PlayingSlots`. System auto‑initializes.
-
----
-## 16. Security Notes
-No remote for moves (ClickDetectors handled by Roblox). All validation server‑side. Seat locking prevents timer abuse. Consider rate limiting if players spam clicks (current busy flag covers animation overlap).
-
----
-## 17. Future Enhancements (Optional)
-* Spectator UI & board replication
-* Persistent scoring (leaderstats/DataStore)
-* Preview ghost token on hover
-* Modularize geometry & timer logic into separate ModuleScripts
-* TweenService token drops & easing camera
-* Logging abstraction replacing raw prints
-
----
-## 18. Quick Deployment
-1. Provide token models under `ReplicatedStorage/Tokens` (Red, Yellow).
-2. (Optional) Add `Highlight` instance for win chain effect.
-3. Add or adjust `Alignment` part and set `FrontOffset` attribute if needed.
-4. Run the place; sit two players; play.
-
----
-## 19. Pseudocode Summary
-```
-initSlot -> build session, hitboxes, seat hooks
-onSeatsChanged -> manage countdown / abort / start match
-startTurnTimer -> wait -> warn -> skip-turn if still idle
-click column -> validate -> place token -> win? highlight -> end; draw? end; else switch turn + timer
-highlightWin -> tween -> delayed endMatch
-endMatch -> narration, camera reset, unlock, delayed board reset
-```
-
----
-## 20. License
-Add a license file (currently unspecified).
-
----
-End of Final Guide
-
