@@ -9,6 +9,25 @@ local RunService = game:GetService("RunService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
+-- Auto-start Coins display (HUD) if module present
+do
+    local ok, coinsModule = pcall(function()
+        local shared = ReplicatedStorage:WaitForChild("Shared")
+        local uiFolder = shared:FindFirstChild("UI")
+        if not uiFolder then return nil end
+        local mod = uiFolder:FindFirstChild("CoinsDisplay")
+        if mod then
+            return require(mod)
+        end
+        return nil
+    end)
+    if ok and coinsModule and typeof(coinsModule) == "table" and coinsModule.start then
+        task.spawn(function()
+            coinsModule.start()
+        end)
+    end
+end
+
 local function getMatchLabel()
     local screenGui = playerGui:FindFirstChild("ScreenGui")
     if not screenGui then return nil end

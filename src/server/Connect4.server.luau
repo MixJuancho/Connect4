@@ -32,10 +32,334 @@ if not MatchCamera then
 end
 
 local TOKENS = ReplicatedStorage:WaitForChild("Tokens")
+-- Require DataManager ModuleScript (not a Script). Add explicit check to surface clearer error if misconfigured.
+local dmObj = script.Parent:WaitForChild("DataManager")
+assert(dmObj:IsA("ModuleScript"), "DataManager must be a ModuleScript; found " .. dmObj.ClassName)
+local DataManager = require(dmObj)
+
+-- Lazy TokenConfig warm (no WaitForChild chain to missing path)
+task.spawn(function()
+    local sharedFolder = ReplicatedStorage:FindFirstChild("Shared")
+    if sharedFolder then
+        local configs = sharedFolder:FindFirstChild("Configs")
+        if configs then
+            local tc = configs:FindFirstChild("TokenConfig")
+            if tc and tc:IsA("ModuleScript") then
+                pcall(function() require(tc) end)
+            end
+        end
+    end
+end)
 local ROWS, COLS = 6, 7
 local SHOW_COLUMN_ZONES = true -- visualize clickable column areas (for debugging/UX)
 local DEBUG_CELL_MARKERS = false -- set true to spawn small parts at each cell center
-local DEBUG_GEOMETRY = true -- set true to print geometry calculations for hitboxes
+local DEBUG_GEOMETRY = false -- disabled to reduce output noise
+local DEBUG_ALIGNMENT = false -- controls alignment/refPart prints
+
+-- Simple admin list: populate with UserIds allowed to run coin commands
+local ADMIN_USER_IDS: {[number]: boolean} = {
+    [157780202] = true, -- owner id provided
+}
+
+local function isAdmin(plr: Player): boolean
+    if ADMIN_USER_IDS[plr.UserId] then return true end
+    -- Treat place owner as admin (works for personal places). For group games this check is permissive only for ownerId.
+    local ownerId = game.CreatorId
+    if ownerId and ownerId ~= 0 and plr.UserId == ownerId then return true end
+    return false
+end
+
+-- Centralized stat initialization (server-authoritative)
+local function ensurePlayerStats(plr: Player)
+    -- Only expose selected stats publicly (hide Coins & HighestStreak from leaderboard)
+    local ls = plr:FindFirstChild("leaderstats")
+    if not ls then
+        ls = Instance.new("Folder")
+        ls.Name = "leaderstats"
+        ls.Parent = plr
+    end
+    local function ensureIntVisible(name)
+        local v = ls:FindFirstChild(name)
+        if not v then
+            v = Instance.new("IntValue")
+            v.Name = name
+            v.Value = 0
+            v.Parent = ls
+        end
+        return v
+    end
+    local wins = ensureIntVisible("Wins")
+    local streak = ensureIntVisible("Streak")
+
+    -- Hidden stats moved to attributes
+    if plr:GetAttribute("Coins") == nil then plr:SetAttribute("Coins", 0) end
+    if plr:GetAttribute("HighestStreak") == nil then plr:SetAttribute("HighestStreak", 0) end
+
+    -- Sync from DataManager profile if loaded
+    pcall(function()
+        local pf = DataManager.getProfile(plr)
+        wins.Value = pf.Wins
+        streak.Value = pf.Streak
+        plr:SetAttribute("Coins", pf.Coins)
+        plr:SetAttribute("HighestStreak", pf.HighestStreak)
+    end)
+
+    -- Change listeners to push updates back into profile
+    wins.Changed:Connect(function(val)
+        DataManager.setStatFromLeaderstat(plr, "Wins", wins.Value)
+    end)
+    streak.Changed:Connect(function(val)
+        DataManager.setStatFromLeaderstat(plr, "Streak", streak.Value)
+        -- Highest streak update
+        local currentHigh = plr:GetAttribute("HighestStreak") or 0
+        if streak.Value > currentHigh then
+            plr:SetAttribute("HighestStreak", streak.Value)
+            DataManager.setStatFromLeaderstat(plr, "HighestStreak", streak.Value)
+        end
+    end)
+end
+
+-- Generic stat command handler (/coins, /wins, /streak, /higheststreak)
+local ATTRIBUTE_STATS: {[string]: boolean} = { Coins = true, HighestStreak = true }
+local LEADERSTATS_STATS: {[string]: boolean} = { Wins = true, Streak = true }
+
+local function handleStatCommand(sender: Player, raw: string, statName: string)
+    if not isAdmin(sender) then return end
+    local lowerStat = statName:lower()
+    if not (ATTRIBUTE_STATS[statName] or LEADERSTATS_STATS[statName]) then
+        warn('[Admin]['..sender.Name..'] Unsupported stat '.. statName)
+        return
+    end
+    -- Tokenize
+    local parts = {}
+    for w in raw:gmatch('%S+') do table.insert(parts, w) end
+    local sub = parts[2] and parts[2]:lower() or nil
+    if not sub or (sub ~= 'add' and sub ~= 'remove' and sub ~= 'set') then
+        print(('[Admin][%s] Usage: /%s add|remove <amount>  OR  /%s add|remove <player> <amount>  OR  /%s set <player> <amount>')
+            :format(sender.Name, lowerStat, lowerStat, lowerStat))
+        return
+    end
+    local target: Player? = sender
+    local amountIndex = 3
+    if sub == 'set' then
+        if not parts[3] or not parts[4] then
+            print(('[Admin][%s] Usage: /%s set <player> <amount>')
+                :format(sender.Name, lowerStat))
+            return
+        end
+        target = Players:FindFirstChild(parts[3]) :: Player?
+        amountIndex = 4
+    else
+        if parts[3] and not tonumber(parts[3]) then
+            target = Players:FindFirstChild(parts[3]) :: Player?
+            amountIndex = 4
+        end
+    end
+    if not target then
+        print('[Admin]['..sender.Name..'] Player not found.')
+        return
+    end
+    local amtStr = parts[amountIndex]
+    if not amtStr then
+        print('[Admin]['..sender.Name..'] Missing amount.')
+        return
+    end
+    local amt = tonumber(amtStr)
+    if not amt then
+        print('[Admin]['..sender.Name..'] Amount must be a number.')
+        return
+    end
+    amt = math.floor(amt)
+    ensurePlayerStats(target)
+
+    local beforeVal: number = 0
+    if ATTRIBUTE_STATS[statName] then
+        local attrVal = target:GetAttribute(statName)
+        if typeof(attrVal) ~= 'number' then attrVal = 0 end
+        beforeVal = attrVal :: number
+    else
+        local ls = target:FindFirstChild('leaderstats')
+        local statObj = ls and ls:FindFirstChild(statName)
+        if not (statObj and statObj:IsA('IntValue')) then
+            print(('[Admin][%s] Stat %s not found for %s'):format(sender.Name, statName, target.Name))
+            return
+        end
+        beforeVal = statObj.Value
+    end
+
+    local newVal = beforeVal
+    if sub == 'set' then newVal = amt
+    elseif sub == 'add' then newVal = newVal + amt
+    elseif sub == 'remove' then newVal = newVal - math.abs(amt) end
+    if newVal < 0 then newVal = 0 end
+
+    if ATTRIBUTE_STATS[statName] then
+        target:SetAttribute(statName, newVal)
+        pcall(function()
+            if DataManager and DataManager.setStatFromLeaderstat then
+                DataManager.setStatFromLeaderstat(target, statName, newVal)
+            end
+        end)
+    else
+        local ls = target:FindFirstChild('leaderstats')
+        local statObj = ls and ls:FindFirstChild(statName)
+        if statObj and statObj:IsA('IntValue') then
+            statObj.Value = newVal -- existing changed connections handle persistence
+        end
+    end
+
+    local delta = newVal - beforeVal
+    print(string.format('[Admin][%s] %s(%s): %d -> %d (%+d)', sender.Name, statName, target.Name, beforeVal, newVal, delta))
+    if sender ~= target then
+        print(string.format('[Admin][Notify %s] %s adjusted your %s: %d -> %d', target.Name, sender.Name, statName:lower(), beforeVal, newVal))
+    end
+end
+
+local function onPlayerAdded(plr: Player)
+    ensurePlayerStats(plr)
+
+    -- Streak tag support
+    -- Clone Assets.Streak (BillboardGui) to character Head and update on streak changes.
+    local TextService = game:GetService("TextService")
+
+    local function getStreakBillboard(character: Model): BillboardGui?
+        local head = character:FindFirstChild("Head")
+        if not head or not head:IsA("BasePart") then return nil end
+        local existing = head:FindFirstChild("StreakTag")
+        if existing and existing:IsA("BillboardGui") then return existing end
+        -- Locate template once
+        local assets = game:GetService("ReplicatedStorage"):FindFirstChild("Assets")
+        local template = assets and assets:FindFirstChild("Streak")
+        if not (template and template:IsA("BillboardGui")) then return nil end
+        local cloned = template:Clone()
+        cloned.Name = "StreakTag"
+        cloned.Enabled = false
+        cloned.Parent = head
+        return cloned
+    end
+
+    local function updateStreakTag(targetPlayer: Player)
+        local character = targetPlayer.Character
+        if not character then return end
+        local bill = getStreakBillboard(character)
+        if not bill then return end
+        -- Obtain streak IntValue from leaderstats
+        local ls = targetPlayer:FindFirstChild("leaderstats")
+        local streakVal = ls and ls:FindFirstChild("Streak")
+        local current = (streakVal and streakVal:IsA("IntValue")) and streakVal.Value or 0
+        if current <= 0 then
+            bill.Enabled = false
+            return
+        end
+        bill.Enabled = true
+        -- Expect hierarchy: BillboardGui -> Frame (maybe) -> Amount (TextLabel)
+        local amountLabel: TextLabel? = nil
+        -- Try direct child named Amount
+        local direct = bill:FindFirstChild("Amount")
+        if direct and direct:IsA("TextLabel") then
+            amountLabel = direct
+        else
+            for _,desc in ipairs(bill:GetDescendants()) do
+                if desc.Name == "Amount" and desc:IsA("TextLabel") then
+                    amountLabel = desc
+                    break
+                end
+            end
+        end
+        if not amountLabel then return end
+        local textStr = tostring(current)
+        amountLabel.Text = textStr
+        -- Dynamic width sizing using GetTextBoundsParams (Montserrat ExtraBold)
+        local params = Instance.new("GetTextBoundsParams")
+        params.Text = textStr
+        -- If the font asset isn't available, fallback to existing font face
+        local okFont, fontFace = pcall(function()
+            return Font.new("rbxasset://fonts/families/Montserrat.json", Enum.FontWeight.ExtraBold)
+        end)
+        if okFont and fontFace then
+            params.Font = fontFace
+            amountLabel.FontFace = fontFace
+        elseif amountLabel.FontFace then
+            params.Font = amountLabel.FontFace
+        else
+            params.Font = Font.fromEnum(amountLabel.Font)
+        end
+        -- Use the label's current pixel height as reference size
+        local pixelHeight = amountLabel.AbsoluteSize.Y
+        if pixelHeight <= 0 then pixelHeight = amountLabel.TextSize end
+        params.Size = pixelHeight
+        local success, bounds = pcall(function()
+            return TextService:GetTextBoundsAsync(params)
+        end)
+        if success and typeof(bounds) == "Vector2" then
+            amountLabel.TextSize = pixelHeight
+            local pad = 8
+            local desiredPixelWidth = bounds.X + pad
+            local billboard = bill
+            local billboardWidth = billboard.AbsoluteSize.X
+            -- Fallback if AbsoluteSize is 0 on server (can happen): keep offset sizing
+            if billboardWidth > 0 then
+                amountLabel.Size = UDim2.fromScale(desiredPixelWidth / billboardWidth, 1)
+            else
+                -- Keep Scale X, adjust offset only
+                amountLabel.Size = UDim2.new(amountLabel.Size.X.Scale, math.floor(desiredPixelWidth), amountLabel.Size.Y.Scale, amountLabel.Size.Y.Offset)
+            end
+        end
+    end
+
+    -- Expose for future modules if needed
+    plr:SetAttribute("_HasStreakTag", true)
+
+    local function hookCharacter(char: Model)
+        -- ensure billboard exists immediately
+        task.defer(function()
+            getStreakBillboard(char)
+            updateStreakTag(plr)
+        end)
+    end
+    if plr.Character then hookCharacter(plr.Character) end
+    plr.CharacterAdded:Connect(hookCharacter)
+
+    -- React to streak changes
+    task.defer(function()
+        local ls = plr:FindFirstChild("leaderstats") or plr:WaitForChild("leaderstats", 10)
+        if ls then
+            local streakVal = ls:FindFirstChild("Streak")
+            if streakVal and streakVal:IsA("IntValue") then
+                streakVal.Changed:Connect(function()
+                    updateStreakTag(plr)
+                end)
+            end
+        end
+    end)
+
+    plr.Chatted:Connect(function(msg)
+        local lower = msg:lower()
+        -- coinadmin legacy
+        if lower:sub(1,10) == '/coinadmin' or lower:sub(1,10) == '!coinadmin' then
+            if isAdmin(plr) then
+                print('[Admin]['..plr.Name..'] Admin stat commands active.')
+            end
+            return
+        end
+        local cmd = lower:match('^[/!](%w+)')
+        if not cmd then return end
+        if cmd == 'coins' then
+            handleStatCommand(plr, msg, 'Coins')
+        elseif cmd == 'wins' then
+            handleStatCommand(plr, msg, 'Wins')
+        elseif cmd == 'streak' then
+            handleStatCommand(plr, msg, 'Streak')
+        elseif cmd == 'higheststreak' then
+            handleStatCommand(plr, msg, 'HighestStreak')
+        end
+    end)
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, existing in ipairs(Players:GetPlayers()) do
+    task.spawn(onPlayerAdded, existing)
+end
 
 -- Choose the two seats closest to the grid part for this slot
 local function getTwoSeatsForSlot(slotModel, gridPart)
@@ -134,10 +458,29 @@ end
 local function getTokenModelFor(player, defaultName)
     local skinName = player:GetAttribute("TokenSkin")
     local modelName = defaultName
-    if typeof(skinName) == "string" and TOKENS:FindFirstChild(skinName) then
+    local useVariant = false
+    if typeof(skinName) == "string" and skinName ~= "" and TOKENS:FindFirstChild(skinName) then
         modelName = skinName
+        -- Determine variant need: both players in session share same skin
+        -- We'll look up current sessions by scanning active sessions for this player (simple linear search)
+        for _, session in pairs(activeSessions) do
+            if session.players and (session.players[1] == player or session.players[2] == player) then
+                local other = (session.players[1] == player) and session.players[2] or session.players[1]
+                if other and other:GetAttribute("TokenSkin") == skinName and other ~= player then
+                    useVariant = (session.players[2] == player) -- arbitrarily second player gets variant
+                end
+                break
+            end
+        end
     end
-    local src = TOKENS:FindFirstChild(modelName)
+    local srcParent = TOKENS
+    if useVariant then
+        local variantsFolder = TOKENS:FindFirstChild("Variants")
+        if variantsFolder and variantsFolder:FindFirstChild(modelName) then
+            srcParent = variantsFolder
+        end
+    end
+    local src = srcParent:FindFirstChild(modelName)
     if src and src:IsA("Model") then
         return src:Clone()
     elseif src and src:IsA("BasePart") then
@@ -349,6 +692,42 @@ function endMatch(session, winner, loser, reason)
             end
         end
     end
+    -- Update stats (Coins, Wins, Streak, HighestStreak) only on terminal outcomes (skip turn timeouts)
+    if reason == "win" then
+        if winner then
+            ensurePlayerStats(winner)
+            local ls = winner:FindFirstChild("leaderstats")
+            local wins = ls and ls:FindFirstChild("Wins")
+            local streak = ls and ls:FindFirstChild("Streak")
+            if wins then wins.Value += 1; DataManager.setStatFromLeaderstat(winner, "Wins", wins.Value) end
+            if streak then streak.Value += 1; DataManager.setStatFromLeaderstat(winner, "Streak", streak.Value) end
+            -- Coins now stored as attribute
+            local coinsAttr = winner:GetAttribute("Coins") :: any
+            local newCoins = (typeof(coinsAttr) == "number" and coinsAttr or 0) + 5
+            winner:SetAttribute("Coins", newCoins)
+            DataManager.setStatFromLeaderstat(winner, "Coins", newCoins)
+            -- Highest streak attribute maintenance
+            if streak then
+                local currentHigh = winner:GetAttribute("HighestStreak")
+                if typeof(currentHigh) ~= "number" or streak.Value > currentHigh then
+                    winner:SetAttribute("HighestStreak", streak.Value)
+                    DataManager.setStatFromLeaderstat(winner, "HighestStreak", streak.Value)
+                end
+            end
+        end
+        if loser then
+            ensurePlayerStats(loser)
+            local ls = loser:FindFirstChild("leaderstats")
+            local streak = ls and ls:FindFirstChild("Streak")
+            if streak then streak.Value = 0; DataManager.setStatFromLeaderstat(loser, "Streak", 0) end
+        end
+    elseif reason == "draw" then
+    -- Draws give no coins now (per latest requirement). No stat mutation.
+    elseif reason == "abort" then
+        -- On abort do not change coins/wins but reset streak for absent player if any
+        -- (Already handled indirectly when they lose? Not awarding here.)
+    end
+
     task.delay(3, function()
         local folder = session.connect4Model:FindFirstChild("SpawnedTokens")
         if folder then folder:ClearAllChildren() end
@@ -877,7 +1256,7 @@ local function initSlot(slotModel)
 
     -- Optional alignment override: a transparent child part used only for token/grid math
     local refPart = findAlignmentPart(connect4Model, grid) or grid
-    if refPart ~= grid then
+    if refPart ~= grid and DEBUG_ALIGNMENT then
         print("[Connect4]["..slotModel.Name.."] Using Alignment part '"..refPart.Name.."' for geometry instead of Grid")
     end
 
@@ -926,7 +1305,9 @@ local function initSlot(slotModel)
     ensureHitboxes(session)
     -- Print initial reference summary
     local rp = session.refPart or session.gridPart
-    print("[Connect4]["..session.slotName.."] Using refPart="..rp.Name.." size="..tostring(rp.Size).." position="..tostring(rp.Position))
+    if DEBUG_ALIGNMENT then
+        print("[Connect4]["..session.slotName.."] Using refPart="..rp.Name.." size="..tostring(rp.Size).." position="..tostring(rp.Position))
+    end
     -- Watch for alignment part added later
     connect4Model.DescendantAdded:Connect(function(d)
         if d:IsA("BasePart") and d.Name == "Alignment" and d.Parent and d.Parent.Name == "Grid" then
