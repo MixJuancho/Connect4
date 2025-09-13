@@ -17,11 +17,11 @@ local M = {
 	Neon = { costCoins = 600 },
 	Noob = { costCoins = 900 },
 	["Yin&Yan"] = { costCoins = 1500 },
-	Blackhole = { productId = 0, note = "Set productId for 79 Robux" },
-	Fire = { productId = 0, note = "Set productId for 49 Robux" },
-	Glitch = { productId = 0, note = "Set productId for 39 Robux" },
+	Blackhole = { productId = 3402976137, note = "79 Robux Blackhole skin" },
+	Fire = { productId = 3402976328, note = "49 Robux Fire skin" },
+	Glitch = { productId = 3402976482, note = "39 Robux Glitch skin" },
 	Marble = { quest = "Play15MinutesLike", note = "Earned by staying 15 minutes and liking the game" },
-	VIP = { gamepassId = 0, note = "Set VIP gamepass id" },
+	VIP = { gamepassId = 1462168838, note = "VIP gamepass" },
 }
 
 -- List of all skin names (cached)

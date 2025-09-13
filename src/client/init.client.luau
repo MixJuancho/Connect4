@@ -329,4 +329,27 @@ task.defer(function()
 			end)
 		end
 	end
+
+	-- Monetization purchase button wiring (Developer Products & Gamepasses)
+	pcall(function()
+		local monetization = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("UI"):WaitForChild("Monetization"))
+		-- Updated mappings to actual hierarchy provided by user
+		monetization.init({ mappings = {
+			-- Developer Product Coin Packs (ScrollingFrame.CurrencyProducts.Coins.<Button>)
+			{ path = {"Frames","Shop","Selection","ScrollingFrame","CurrencyProducts","Coins","250Coins"}, product = "250Coins" },
+			{ path = {"Frames","Shop","Selection","ScrollingFrame","CurrencyProducts","Coins","1000Coins"}, product = "1000Coins" },
+			{ path = {"Frames","Shop","Selection","ScrollingFrame","CurrencyProducts","Coins","2500Coins"}, product = "2500Coins" },
+			{ path = {"Frames","Shop","Selection","ScrollingFrame","CurrencyProducts","Coins","4000Coins"}, product = "4000Coins" },
+			-- Starter Pack (outside main shop)
+			{ path = {"Frames","StarterPack","Purchase"}, product = "StarterPack" },
+			-- Skins via TokenShop proximity prompts happen server-side; still allow UI buttons if present
+			{ path = {"Frames","Shop","Selection","ScrollingFrame","FeaturedGamepasses","VIP"}, gamepass = "VIP" },
+			{ path = {"Frames","Shop","Selection","ScrollingFrame","Gamepasses","GravityGun"}, gamepass = "GravityGun" },
+			{ path = {"Frames","Shop","Selection","ScrollingFrame","Gamepasses","MagicCarpet"}, gamepass = "MagicCarpet" },
+			{ path = {"Frames","Shop","Selection","ScrollingFrame","Gamepasses","Boombox"}, gamepass = "Boombox" },
+			-- Coin Rain (Frames.CoinsRain.Selection)
+			{ path = {"Frames","CoinsRain","Selection","Server"}, effect = "ServerRain" },
+			{ path = {"Frames","CoinsRain","Selection","Global"}, effect = "GlobalRain" },
+		} })
+	end)
 end)

@@ -1,8 +1,8 @@
 <div align="center">
 
-# Connect4 – Multi‑Table, Skins & Economy Enabled
+# Connect4 – Multi‑Table, Skins, Economy & Monetization
 
-Server‑authoritative multi‑slot (multi‑table) Connect 4 with token skins, coin economy, instant UI updates, attribute‑based stats, match camera, win highlighting & modular UI helpers.
+Server‑authoritative multi‑slot (multi‑table) Connect 4 with token skins, coin economy, developer products & gamepasses, ordered leaderboards, instant UI updates, attribute‑based stats, match camera, win highlighting & modular UI helpers.
 
 </div>
 
@@ -19,9 +19,10 @@ Gameplay:
 - Cinematic camera focus (`MatchCamera` RemoteEvent) + player transparency; auto restore.
 - Seat locking (walk/jump disabled) with safe restoration.
 
-Economy & Skins:
+Economy, Skins & Monetization:
 - Coin attribute (`Player:GetAttribute("Coins")`) stored in persistent profile.
-- Token skins (purchasable, product/gamepass/quest placeholders) defined in `TokenConfig`.
+- Token skins defined in `TokenConfig` (+ optional `MonetizationConfig` for product & gamepass IDs).
+- Developer products & gamepasses handled in `Monetization.server.luau` (coin packs, skins, coin rain effects, VIP skin grant etc.).
 - Immediate UI refresh after purchase via `TokenInventory/Purchased` RemoteEvent.
 - Same‑skin disambiguation: second player auto variant (if variant asset available) or subtle hue shift.
 
@@ -33,8 +34,12 @@ UI & Feedback:
 
 Persistence & Stats:
 - Profile (DataStore key `Player_<UserId>`): Coins, Wins, Streak, HighestStreak, OwnedSkins.
-- Coins & HighestStreak hidden from leaderboard (attributes only); Wins & Streak visible.
+- Ordered leaderboards (Wins, HighestStreak) via `LeaderboardManager.server.luau` with placeholder entries if empty.
+- Coins & HighestStreak hidden from classic leaderboard (attributes only); Wins & Streak visible.
 - Autosave loop + safe BindToClose flush.
+
+Removed / Deferred:
+- Prior experimental VIP chat tag system removed (no active chat tag scripts). Re‑adding later would use a lightweight TextChatService client formatter.
 
 Admin & Debug:
 - `/coins add|remove <amt>` or `/coins set <player> <amt>` (admin list in `Connect4.server.luau`).
@@ -47,18 +52,20 @@ src/
 		Connect4.server.luau        # Core multi-table game logic (session lifecycle, win logic, admin coins)
 		DataManager.luau            # Persistence & token inventory RemoteFunction
 		TokenShop.server.luau       # Proximity prompt coin skin purchases -> fires Purchased event
-		SetupConnect4.server.luau   # (If present) bootstrap or legacy setup helpers
+		Monetization.server.luau    # Dev products, gamepasses, coin rain, VIP skin granting
+		LeaderboardManager.server.luau # OrderedDataStore leaderboards (Wins / HighestStreak)
 		init.server.luau            # Entry aggregation (optional)
 	client/
 		Connect4.client.luau        # Client narration & camera handling
-		init.client.luau            # HUD + SFX + music toggle + coins SFX + skins UI bootstrap
+		init.client.luau            # HUD + SFX + music toggle + coins SFX + skins & monetization UI bootstrap
 	shared/
 		UI/
 			init.luau                 # Hover/click tween helpers & open/close animations
 			SkinsUI.luau              # Dynamic skins list, equip/unequip, purchase refresh
 			CoinsDisplay.luau         # Attribute-first coin label updater & animation
 		Configs/
-			TokenConfig.luau          # Skin metadata (costCoins / productId / etc.)
+			TokenConfig.luau          # Skin metadata (coin costs & legacy product ids)
+			MonetizationConfig.luau   # (If present) structured products & gamepasses
 		Modules/                    # (Reserved for future shared modules)
 ```
 Expected Roblox hierarchy (runtime):

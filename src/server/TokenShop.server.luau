@@ -8,6 +8,15 @@ local Players = game:GetService("Players")
 local MarketplaceService = game:GetService("MarketplaceService")
 
 local DataManager = require(script.Parent:WaitForChild("DataManager"))
+local TokenConfig: any = nil
+pcall(function()
+	local sharedFolder = ReplicatedStorage:FindFirstChild("Shared")
+	local cfgs = sharedFolder and sharedFolder:FindFirstChild("Configs")
+	local tc = cfgs and cfgs:FindFirstChild("TokenConfig")
+	if tc and tc:IsA("ModuleScript") then
+		TokenConfig = require(tc)
+	end
+end)
 
 local shopRoot = Workspace:FindFirstChild("TokenShop")
 if not shopRoot then
@@ -47,8 +56,14 @@ local function attach(folder: Instance, kind: string)
 						end
 					end
 				elseif kind == "Robux" then
-					-- Future: Developer Product / Gamepass logic
-					print("[TokenShop] Robux purchase path not implemented for", skinName)
+					-- Developer Product path using TokenConfig.productId
+					local meta = TokenConfig and TokenConfig[skinName]
+					local productId = meta and meta.productId
+					if typeof(productId) == "number" and productId > 0 then
+						MarketplaceService:PromptProductPurchase(player, productId)
+					else
+						print("[TokenShop] No valid productId for Robux skin", skinName)
+					end
 				end
 			end)
 		end
@@ -78,7 +93,13 @@ shopRoot.DescendantAdded:Connect(function(inst)
 						end
 					end
 				else
-					print("[TokenShop] Robux purchase path not implemented for", skinName)
+					local meta = TokenConfig and TokenConfig[skinName]
+					local productId = meta and meta.productId
+					if typeof(productId) == "number" and productId > 0 then
+						MarketplaceService:PromptProductPurchase(player, productId)
+					else
+						print("[TokenShop] No valid productId for Robux skin", skinName)
+					end
 				end
 			end)
 		end

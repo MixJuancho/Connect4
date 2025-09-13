@@ -702,8 +702,16 @@ function endMatch(session, winner, loser, reason)
             if wins then wins.Value += 1; DataManager.setStatFromLeaderstat(winner, "Wins", wins.Value) end
             if streak then streak.Value += 1; DataManager.setStatFromLeaderstat(winner, "Streak", streak.Value) end
             -- Coins now stored as attribute
+            local baseAward = 5
+            local vipMult = 1
+            if _G.Connect4_IsPlayerVIP then
+                local ok, isVIP = pcall(function()
+                    return _G.Connect4_IsPlayerVIP(winner)
+                end)
+                if ok and isVIP then vipMult = 2 end
+            end
             local coinsAttr = winner:GetAttribute("Coins") :: any
-            local newCoins = (typeof(coinsAttr) == "number" and coinsAttr or 0) + 5
+            local newCoins = (typeof(coinsAttr) == "number" and coinsAttr or 0) + baseAward * vipMult
             winner:SetAttribute("Coins", newCoins)
             DataManager.setStatFromLeaderstat(winner, "Coins", newCoins)
             -- Highest streak attribute maintenance
