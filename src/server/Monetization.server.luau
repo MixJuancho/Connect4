@@ -12,6 +12,22 @@ local TextChatService = game:GetService("TextChatService")
 local RECEIPT_DS = DataStoreService:GetDataStore("ProcessedReceiptsV1")
 local COIN_RAIN_TOPIC = "GlobalCoinRainV1"
 
+-- Notification infrastructure (central RemoteEvent + global relay)
+local notificationsFolder = ReplicatedStorage:FindFirstChild("Notifications")
+if not notificationsFolder then
+	notificationsFolder = Instance.new("Folder")
+	notificationsFolder.Name = "Notifications"
+	notificationsFolder.Parent = ReplicatedStorage
+end
+local showNotificationEvent: RemoteEvent = (function()
+	local ev = notificationsFolder:FindFirstChild("Show")
+	if ev and ev:IsA("RemoteEvent") then return ev end
+	local newEv = Instance.new("RemoteEvent")
+	newEv.Name = "Show"
+	newEv.Parent = notificationsFolder
+	return newEv
+end)()
+
 local DataManager = require(script.Parent:WaitForChild("DataManager"))
 
 -- Load configs -----------------------------------------------------
@@ -38,6 +54,24 @@ if invFolder then
 		purchasedEvent.Parent = invFolder
 	end
 end
+
+-- RemoteEvent for immediate gamepass purchase notification (client -> server)
+local monetizationFolder = ReplicatedStorage:FindFirstChild("Monetization")
+if not monetizationFolder then
+	monetizationFolder = Instance.new("Folder")
+	monetizationFolder.Name = "Monetization"
+	monetizationFolder.Parent = ReplicatedStorage
+end
+local gamepassPurchasedEvent: RemoteEvent = (
+	function()
+		local ev = monetizationFolder:FindFirstChild("GamepassPurchased")
+		if ev and ev:IsA("RemoteEvent") then return ev end
+		local newEv = Instance.new("RemoteEvent")
+		newEv.Name = "GamepassPurchased"
+		newEv.Parent = monetizationFolder
+		return newEv
+	end
+)()
 
 -- Tables -----------------------------------------------------------
 local PRODUCT_HANDLERS: {[number]: (player: Player, receipt: any?)->() } = {}
@@ -94,29 +128,96 @@ _G.Connect4_IsPlayerVIP = isVIP
 
 -- Coin Rain --------------------------------------------------------
 local function spawnCoinRain(duration: number, coinCount: number, awardPerCoin: number)
-	local base = workspace:FindFirstChild("Baseplate") or workspace:FindFirstChildWhichIsA("Terrain")
-	if not base then return end
-	local areaCFrame = if base:IsA("BasePart") then base.CFrame else CFrame.new()
-	local areaSize = if base:IsA("BasePart") then base.Size else Vector3.new(300,0,300)
+	local rainAreaFolder = workspace:FindFirstChild("RainArea")
+	if not rainAreaFolder then
+		warn("[CoinRain] Could not start coin rain: 'RainArea' folder not found in Workspace.")
+		return
+	end
+
+	-- Calculate total area for weighted random selection
+	local weightedZones: {{part: BasePart, cumulativeArea: number}} = {}
+	local totalArea = 0
+	for _, zone in ipairs(rainAreaFolder:GetChildren()) do
+		if zone:IsA("BasePart") then
+			local area = zone.Size.X * zone.Size.Z
+			if area > 0 then -- Ignore parts with no surface area
+				totalArea += area
+				table.insert(weightedZones, { part = zone, cumulativeArea = totalArea })
+			end
+		end
+	end
+
+	if #weightedZones == 0 then
+		warn("[CoinRain] Could not start coin rain: 'RainArea' folder in Workspace has no valid BasePart children with surface area > 0.")
+		return
+	end
+
 	local endTime = tick() + duration
+
 	local debrisFolder = Instance.new("Folder")
 	debrisFolder.Name = "_CoinRain_"..tostring(os.time())
 	debrisFolder.Parent = workspace
 
+	-- Locate coin template once for efficiency. Designers can place a customizable
+	-- part / mesh / model named "CoinRain" under ReplicatedStorage/Assets.
+	local assets = ReplicatedStorage:FindFirstChild("Assets")
+	local coinTemplateSource = assets and assets:FindFirstChild("CoinRain")
+	local coinTemplate: BasePart? = nil
+	if coinTemplateSource then
+		if coinTemplateSource:IsA("BasePart") then
+			coinTemplate = coinTemplateSource
+		elseif coinTemplateSource:IsA("Model") or coinTemplateSource:IsA("Folder") then
+			coinTemplate = coinTemplateSource:FindFirstChildWhichIsA("BasePart", true)
+		end
+	end
+	local warnedFallback = false
+
+	-- Helper to pick a random zone, weighted by its surface area.
+	-- Larger zones will be picked more often.
+	local function pickWeightedZone(): BasePart
+		local rand = math.random() * totalArea
+		for _, zoneInfo in ipairs(weightedZones) do
+			if rand <= zoneInfo.cumulativeArea then
+				return zoneInfo.part
+			end
+		end
+		-- Fallback in case of floating point inaccuracies, return the last zone.
+		return weightedZones[#weightedZones].part
+	end
+
 	local function spawnOne()
-		local part = Instance.new("Part")
+		local part: BasePart
+		if coinTemplate then
+			part = coinTemplate:Clone()
+		else
+			-- Fallback: create a simple neon gold sphere like the original implementation
+			local fallback = Instance.new("Part")
+			fallback.Shape = Enum.PartType.Ball
+			fallback.Material = Enum.Material.Neon
+			fallback.Color = Color3.fromRGB(255, 215, 0)
+			fallback.Size = Vector3.new(1,1,1)
+			part = fallback
+			if not warnedFallback then
+				warnedFallback = true
+				warn("[CoinRain] Using fallback part; place a BasePart (or Model with a BasePart descendant) named 'CoinRain' under ReplicatedStorage/Assets for custom visuals.")
+			end
+		end
+
+		-- Common properties applied to both cloned template and fallback
 		part.Anchored = false
-		part.Size = Vector3.new(1,1,1)
-		part.Shape = Enum.PartType.Ball
-		part.Material = Enum.Material.Neon
-		part.Color = Color3.fromRGB(255, 215, 0)
 		part.Name = "RainCoin"
-		part.TopSurface = Enum.SurfaceType.Smooth
-		part.BottomSurface = Enum.SurfaceType.Smooth
-		local rx = (math.random()-0.5) * (areaSize.X * 0.8)
-		local rz = (math.random()-0.5) * (areaSize.Z * 0.8)
+		if part:IsA("BasePart") then
+			part.TopSurface = Enum.SurfaceType.Smooth
+			part.BottomSurface = Enum.SurfaceType.Smooth
+		end
+
+		-- Pick a random zone (weighted by area) and spawn a coin within its bounds
+		local zone = pickWeightedZone()
+		local rx = (math.random() - 0.5) * zone.Size.X
+		local rz = (math.random() - 0.5) * zone.Size.Z
 		local dropHeight = 25 + math.random()*10
-		part.CFrame = areaCFrame + Vector3.new(rx, dropHeight, rz)
+		part.CFrame = zone.CFrame * CFrame.new(rx, dropHeight, rz)
+
 		part.Parent = debrisFolder
 		local touchedConn
 		local claimed = false
@@ -140,9 +241,6 @@ local function spawnCoinRain(duration: number, coinCount: number, awardPerCoin: 
 			coinCount -= 1
 			task.wait(spawnInterval)
 		end
-		task.delay(15, function()
-			if debrisFolder then debrisFolder:Destroy() end
-		end)
 	end)
 end
 
@@ -173,6 +271,23 @@ local function ensureSubscribe()
 end
 ensureSubscribe()
 
+-- Global notification subscription (relay to all clients on this server)
+pcall(function()
+	MessagingService:SubscribeAsync("GlobalNotificationV1", function(message)
+		local data = message.Data
+		if typeof(data) == "table" and data.text and data.type then
+			pcall(function()
+				-- Relay UI notification to all clients on this server
+				showNotificationEvent:FireAllClients(data)
+				-- Also display system message in chat if provided in the payload
+				if typeof(data.systemMessage) == "string" and data.systemMessage ~= "" then
+					TextChatService.TextChannels.RBXGeneral:DisplaySystemMessage(data.systemMessage)
+				end
+			end)
+		end
+	end)
+end)
+
 -- Product Handlers -------------------------------------------------
 local function buildProductHandlers()
 	local products = (MonetizationConfig and MonetizationConfig.Products) or (TokenConfig and TokenConfig.Products)
@@ -184,13 +299,36 @@ local function buildProductHandlers()
 			if typeof(info) == "table" and tonumber(info.productId) and tonumber(info.amount) then
 				local pid = info.productId
 				PRODUCT_HANDLERS[pid] = function(player)
+					-- For one-time purchases like StarterPack, check if already owned.
+					if info.grantSkin then -- Assuming packs that grant skins are one-time.
+						if DataManager.hasOneTimePurchase(player, info.uiKey) then
+							print(("[Monetization] Player %s already owns one-time item '%s'. Purchase granted without reward."):format(player.Name, info.uiKey))
+							return
+						end
+					end
 					awardCoins(player, info.amount)
 					if info.grantSkin and DataManager and DataManager.addSkin then
 						DataManager.addSkin(player, info.grantSkin)
 						if purchasedEvent then
 							purchasedEvent:FireClient(player, info.grantSkin)
 						end
+						DataManager.addOneTimePurchase(player, info.uiKey)
 					end
+					-- Notification
+					local notificationText
+					if info.uiKey == "StarterPack" then
+						notificationText = "You bought the Starter Pack!"
+					else
+						notificationText = string.format("You purchased %s coins!", tostring(info.amount))
+					end
+					pcall(function()
+						showNotificationEvent:FireClient(player, {
+							text = notificationText,
+							type = "Green",
+							sound = "Purchase"
+						})
+					end)
+					DataManager.markDirty(player)
 				end
 			end
 		end
@@ -202,12 +340,32 @@ local function buildProductHandlers()
 			if typeof(info) == "table" and tonumber(info.productId) and info.skin then
 				local pid = info.productId
 				PRODUCT_HANDLERS[pid] = function(player)
+					if DataManager.hasSkin(player, info.skin) then
+						print(("[Monetization] Player %s already owns skin '%s'. Purchase granted without reward."):format(player.Name, info.skin))
+						pcall(function()
+							showNotificationEvent:FireClient(player, {
+								text = "You already own this skin!",
+								type = "Normal",
+								sound = "Notification"
+							})
+						end)
+						return
+					end
+
 					if DataManager and DataManager.addSkin then
 						DataManager.addSkin(player, info.skin)
 						if purchasedEvent then
 							purchasedEvent:FireClient(player, info.skin)
 						end
 					end
+					pcall(function()
+						showNotificationEvent:FireClient(player, {
+							text = string.format("You purchased the %s skin!", info.skin),
+							type = "Green",
+							sound = "Purchase"
+						})
+					end)
+					DataManager.markDirty(player)
 				end
 			end
 		end
@@ -218,11 +376,32 @@ local function buildProductHandlers()
 		for _, info in pairs(effects) do
 			if typeof(info) == "table" and tonumber(info.productId) and info.type then
 				local pid = info.productId
-				PRODUCT_HANDLERS[pid] = function(_player)
+				PRODUCT_HANDLERS[pid] = function(player)
 					if info.type == "ServerCoinRain" then
 						triggerServerCoinRain(info.duration, info.coinCount)
+						local message = string.format("[SERVER] %s started a Coin Rain!", player.Name)
+						pcall(function()
+							showNotificationEvent:FireAllClients({
+								text = message,
+								type = "Normal",
+								sound = "Notification"
+							})
+							TextChatService.TextChannels.RBXGeneral:DisplaySystemMessage(message)
+						end)
 					elseif info.type == "GlobalCoinRain" then
 						triggerGlobalCoinRain(info.duration, info.coinCount)
+						-- Construct messages once
+						local uiText = string.format("%s started a Global Coin Rain!", player.Name)
+						local systemMessage = string.format("[GLOBAL] %s started a Global Coin Rain!", player.Name)
+						-- Publish global notification for other servers
+						pcall(function()
+							MessagingService:PublishAsync("GlobalNotificationV1", {
+								text = uiText,
+								systemMessage = systemMessage,
+								type = "Normal",
+								sound = "Notification"
+							})
+						end)
 					end
 				end
 			end
@@ -240,6 +419,13 @@ for skinName, meta in pairs(TokenConfig) do
 				if DataManager and DataManager.addSkin then
 					DataManager.addSkin(player, skinName)
 				end
+				pcall(function()
+					showNotificationEvent:FireClient(player, {
+						text = string.format("You purchased the %s skin!", skinName),
+						type = "Green",
+						sound = "Purchase"
+					})
+				end)
 			end
 		end
 	end
@@ -270,6 +456,10 @@ local function onPlayerAdded(player: Player)
 			if not DataManager.hasSkin(player, vipSkinName) then
 				DataManager.addSkin(player, vipSkinName)
 			end
+			-- Set chat tag attribute for VIP players (consumed by ChatTagManager)
+			if isVIP(player) then
+				player:SetAttribute("ChatTag", "VIP")
+			end
 		end
 	end)
 	player.CharacterAdded:Connect(function(char)
@@ -291,6 +481,71 @@ local function onPlayerAdded(player: Player)
 end
 Players.PlayerAdded:Connect(onPlayerAdded)
 for _, plr in ipairs(Players:GetPlayers()) do task.spawn(onPlayerAdded, plr) end
+
+-- VIP Chat Tag attribute (consumed by a separate chat formatter) ----
+pcall(function()
+	if TextChatService and TextChatService:FindFirstChild("ChatInputBarConfiguration") then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if isVIP(plr) then plr:SetAttribute("ChatTag", "VIP") end
+		end
+		Players.PlayerAdded:Connect(function(plr)
+			if isVIP(plr) then plr:SetAttribute("ChatTag", "VIP") end
+		end)
+	end
+end)
+
+-- Immediate gamepass perk granting after client notifies purchase ----
+local function grantGamepassPerks(player: Player, gpId: number)
+	-- Re-validate ownership server-side
+	if not ownsGamepassAsync(player, gpId) then
+		warn(string.format("[Monetization] Player %s attempted to claim gamepass %d but does not own it.", player.Name, gpId))
+		return
+	end
+
+	-- VIP perks
+	if vipGamepassId and gpId == vipGamepassId then
+		if vipSkinName and DataManager and DataManager.addSkin and DataManager.hasSkin then
+			if not DataManager.hasSkin(player, vipSkinName) then
+				DataManager.addSkin(player, vipSkinName)
+				if purchasedEvent then
+					purchasedEvent:FireClient(player, vipSkinName)
+				end
+			end
+		end
+		player:SetAttribute("ChatTag", "VIP")
+		print(string.format("[Monetization] Granted VIP perks to %s (gamepass %d)", player.Name, gpId))
+		pcall(function()
+			showNotificationEvent:FireClient(player, {
+				text = "You unlocked the VIP Gamepass!",
+				type = "Green",
+				sound = "Purchase"
+			})
+		end)
+	end
+
+	-- Tool gamepasses
+	local toolName = toolGamepasses[gpId]
+	if toolName then
+		local assets = ReplicatedStorage:FindFirstChild("Assets")
+		local gear = assets and assets:FindFirstChild("Gear")
+		if gear then
+			local tool = gear:FindFirstChild(toolName)
+			if tool and tool:IsA("Tool") then
+				if not player.Backpack:FindFirstChild(toolName) and not (player.Character and player.Character:FindFirstChild(toolName)) then
+					local clone = tool:Clone()
+					clone.Parent = player.Backpack
+					print(string.format("[Monetization] Granted tool '%s' to %s (gamepass %d)", toolName, player.Name, gpId))
+				end
+			end
+		end
+	end
+end
+
+gamepassPurchasedEvent.OnServerEvent:Connect(function(player, gpId)
+	if typeof(gpId) == "number" then
+		grantGamepassPerks(player, gpId)
+	end
+end)
 
 -- ProcessReceipt ---------------------------------------------------
 function MarketplaceService.ProcessReceipt(receiptInfo)
@@ -320,9 +575,23 @@ end
 local API = {}
 function API.ServerCoinRain(duration: number?, coinCount: number?)
 	triggerServerCoinRain(duration, coinCount)
+	pcall(function()
+		showNotificationEvent:FireAllClients({
+			text = "A Coin Rain has started!",
+			type = "Normal",
+			sound = "Notification"
+		})
+	end)
 end
 function API.GlobalCoinRain(duration: number?, coinCount: number?)
 	triggerGlobalCoinRain(duration, coinCount)
+	pcall(function()
+		MessagingService:PublishAsync("GlobalNotificationV1", {
+			text = "A Global Coin Rain has started!",
+			type = "Normal",
+			sound = "Notification"
+		})
+	end)
 end
 
 return API

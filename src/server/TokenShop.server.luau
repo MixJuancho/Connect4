@@ -39,6 +39,29 @@ if invFolder then
 	end
 end
 
+-- Notification remote (if available)
+local notificationsFolder = ReplicatedStorage:FindFirstChild("Notifications")
+local showNotificationEvent: RemoteEvent? = notificationsFolder and notificationsFolder:FindFirstChild("Show") :: RemoteEvent?
+
+local function handleRobuxPurchase(player: Player, skinName: string)
+	if DataManager.hasSkin(player, skinName) then
+		if showNotificationEvent then
+			pcall(function()
+				showNotificationEvent:FireClient(player, {
+					text = "You already own this skin!",
+					type = "Normal",
+					sound = "Notification",
+				})
+			end)
+		end
+		return
+	end
+	local meta = TokenConfig and TokenConfig[skinName]
+	local productId = meta and meta.productId
+	if typeof(productId) == "number" and productId > 0 then
+		MarketplaceService:PromptProductPurchase(player, productId)
+	end
+end
 -- Helper to attach prompt listeners recursively
 local function attach(folder: Instance, kind: string)
 	for _, inst in ipairs(folder:GetDescendants()) do
@@ -54,16 +77,18 @@ local function attach(folder: Instance, kind: string)
 						if purchasedEvent then
 							purchasedEvent:FireClient(player, skinName)
 						end
+						if showNotificationEvent then
+							pcall(function()
+								showNotificationEvent:FireClient(player, {
+									text = string.format("You purchased the %s skin!", skinName),
+									type = "Green",
+									sound = "Purchase"
+								})
+							end)
+						end
 					end
 				elseif kind == "Robux" then
-					-- Developer Product path using TokenConfig.productId
-					local meta = TokenConfig and TokenConfig[skinName]
-					local productId = meta and meta.productId
-					if typeof(productId) == "number" and productId > 0 then
-						MarketplaceService:PromptProductPurchase(player, productId)
-					else
-						print("[TokenShop] No valid productId for Robux skin", skinName)
-					end
+					handleRobuxPurchase(player, skinName)
 				end
 			end)
 		end
@@ -91,15 +116,18 @@ shopRoot.DescendantAdded:Connect(function(inst)
 						if purchasedEvent then
 							purchasedEvent:FireClient(player, skinName)
 						end
+						if showNotificationEvent then
+							pcall(function()
+								showNotificationEvent:FireClient(player, {
+									text = string.format("You purchased the %s skin!", skinName),
+									type = "Green",
+									sound = "Purchase"
+								})
+							end)
+						end
 					end
 				else
-					local meta = TokenConfig and TokenConfig[skinName]
-					local productId = meta and meta.productId
-					if typeof(productId) == "number" and productId > 0 then
-						MarketplaceService:PromptProductPurchase(player, productId)
-					else
-						print("[TokenShop] No valid productId for Robux skin", skinName)
-					end
+					handleRobuxPurchase(player, skinName)
 				end
 			end)
 		end
